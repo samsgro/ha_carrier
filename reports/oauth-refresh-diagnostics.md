@@ -20,10 +20,14 @@ No thermostat, entity, or config-flow behavior changed.
 | Repo | Upstream tag | Fork | Branch | Verified head |
 | --- | --- | --- | --- | --- |
 | `carrier_api` | v3.6.0 (`43f9ddcbcbb026ca97333db0c9908751f459bcaf`) | https://github.com/samsgro/carrier_api | `oauth-refresh-diagnostics` | `af96d9514a71a6050e6642e9e12d553bf7f41c08` |
-| `ha_carrier` | v2.28.2 (`533a4f471a1e8bcf7d18d6af93651fe240124f37`) | https://github.com/samsgro/ha_carrier | `oauth-refresh-diagnostics` | `6dc145b02fce6f0ea39069cd40ac4ee1553ccc15` |
+| `ha_carrier` | v2.28.2 (`533a4f471a1e8bcf7d18d6af93651fe240124f37`) | https://github.com/samsgro/ha_carrier | `oauth-refresh-diagnostics` | `18ac5c5ef2a8514a353da25eaf72efbf80bc9929` |
 
 `carrier_api` code fix commit: `8b938f201c140ca80c6530b6c8c96dd0128105d9`.  
 `carrier_api` docs/pin commit (branch tip): `af96d9514a71a6050e6642e9e12d553bf7f41c08`.
+
+Challenger-verified `ha_carrier` head is `18ac5c5ef2a8514a353da25eaf72efbf80bc9929`
+(replacing stale `6dc145b02fce6f0ea39069cd40ac4ee1553ccc15`). `carrier_api`
+head remains `af96d9514a71a6050e6642e9e12d553bf7f41c08`.
 
 Previous reviewed `oauthdiag.1` heads were `84295ff…` and `5833c75…`.
 This follow-up keeps those commits in history and adds the body-consume
