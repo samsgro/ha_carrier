@@ -92,13 +92,14 @@ The integration adds a Home Assistant device per Carrier system, with entities f
 
 1. Continue with [Configuration](#configuration) below.
 
-### Diagnostic fork (`2.28.2+oauthdiag.1`)
+### Diagnostic fork (`2.28.2+oauthdiag.2`)
 
 This fork does **not** change thermostat entities, config flow, or setpoints.
-It pins `carrier-api 3.6.0+oauthdiag.1` at immutable commit
-`84295ff294f0c97d7c978ca1ec0062f0587d3418` so Home Assistant can log
+It pins `carrier-api 3.6.0+oauthdiag.2` at immutable commit
+`af96d9514a71a6050e6642e9e12d553bf7f41c08` so Home Assistant can log
 secret-safe OAuth refresh diagnostics (status, content type, body class,
-length/hash, allowlisted OAuth error fields, and request IDs).
+length/hash, allowlisted OAuth error fields, and request IDs). Token refresh
+reads the OAuth JSON/body before aiohttp `raise_for_status` can release it.
 
 See [DIAGNOSTIC_INSTALL.md](DIAGNOSTIC_INSTALL.md) for install and rollback
 steps. Do not use this branch's automated `carrier-api==` pin updater; the
