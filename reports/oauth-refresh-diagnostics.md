@@ -17,10 +17,14 @@ entity, or config-flow behavior changed.
 
 ## Forks and commits
 
-| Repo | Upstream tag | Fork | Branch | HEAD SHA |
+| Repo | Upstream tag | Fork | Branch | Verified head |
 | --- | --- | --- | --- | --- |
 | `carrier_api` | v3.6.0 (`43f9ddcbcbb026ca97333db0c9908751f459bcaf`) | https://github.com/samsgro/carrier_api | `oauth-refresh-diagnostics` | `84295ff294f0c97d7c978ca1ec0062f0587d3418` |
-| `ha_carrier` | v2.28.2 (`533a4f471a1e8bcf7d18d6af93651fe240124f37`) | https://github.com/samsgro/ha_carrier | `oauth-refresh-diagnostics` | `438a1b8605d17b43dca49d9c8e5bff09f4d251cc` |
+| `ha_carrier` | v2.28.2 (`533a4f471a1e8bcf7d18d6af93651fe240124f37`) | https://github.com/samsgro/ha_carrier | `oauth-refresh-diagnostics` | `5833c758fad7ace14f9903a0f778e24d4d652345` |
+
+Challenger-verified `ha_carrier` head is `5833c758fad7ace14f9903a0f778e24d4d652345`
+(replacing stale `438a1b8605d17b43dca49d9c8e5bff09f4d251cc`). `carrier_api`
+head remains `84295ff294f0c97d7c978ca1ec0062f0587d3418`.
 
 Diagnostic versions:
 
