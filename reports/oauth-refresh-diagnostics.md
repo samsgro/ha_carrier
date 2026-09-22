@@ -164,8 +164,25 @@ Worker: Orca dispatched builder (`task_3fc4d6ec0841`)
 default-off options and a `schedule_fn` only. Unload awaits
 `api_connection.cleanup()` before platform unload. Diagnostics may
 include a redacted `oauth_session` block. Climate entity logic is
-unchanged. Recovery stays off by default.
+unchanged. Recovery stayed off by default in this experimental
+oauthdiag.3 fork only.
 
-Lock-layer regressions require hard pin rollback to `oauthdiag.2`
-(`af96d9514a71a6050e6642e9e12d553bf7f41c08`). Option toggles do not
-revert lock/atomicity.
+Lock-layer regressions from oauthdiag.3 require hard pin rollback to
+`oauthdiag.2` (`af96d9514a71a6050e6642e9e12d553bf7f41c08`). Option
+toggles do not revert lock/atomicity.
+
+---
+
+## oauthfix.1 production follow-up
+
+Date: 2026-09-22
+
+`ha_carrier` `2.28.2+oauthfix.1` pins `carrier_api` `3.6.0+oauthfix.1`
+at immutable commit `2996935ba39ede773c6211e6de51cfa6a52cc0c8`.
+`invalid_grant` recovery is always-on production behavior: one refresh
+grant at expiry, then up to three `assistedLogin` attempts with 1s then
+3s backoff. Experiment options and the early-refresh canary are gone.
+Assisted login uses the same 60s GraphQL execute timeout as
+authenticated queries. Transient exhaustion leaves
+`RECOVERY_PENDING` (not `AUTH_FAILED`), keeps the pair and suppressed
+refresh fingerprint, and retries login directly on the next cycle.

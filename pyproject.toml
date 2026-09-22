@@ -22,7 +22,7 @@ version = { attr = "custom_components.ha_carrier.const.VERSION" }
 
 [dependency-groups]
 ha = [
-    "carrier-api @ git+https://github.com/samsgro/carrier_api.git@bf759dcd7a5fe839202377559e2d16ede1c934bb",
+    "carrier-api @ git+https://github.com/samsgro/carrier_api.git@2996935ba39ede773c6211e6de51cfa6a52cc0c8",
     "homeassistant",
 ]
 lint = [
