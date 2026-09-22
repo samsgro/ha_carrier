@@ -13,9 +13,13 @@ import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 
 from .const import (
+    CONF_EARLY_REFRESH_CANARY,
     CONF_INFINITE_HOLDS,
+    CONF_INVALID_GRANT_RECOVERY,
     CONFIG_FLOW_VERSION,
+    DEFAULT_EARLY_REFRESH_CANARY,
     DEFAULT_INFINITE_HOLDS,
+    DEFAULT_INVALID_GRANT_RECOVERY,
     DOMAIN,
     ERROR_AUTH,
     ERROR_CANNOT_CONNECT,
@@ -327,6 +331,18 @@ class CarrierOptionsFlow(OptionsFlow):
                 vol.Required(
                     CONF_INFINITE_HOLDS,
                     default=config_entry.options.get(CONF_INFINITE_HOLDS, DEFAULT_INFINITE_HOLDS),
+                ): cv.boolean,
+                vol.Optional(
+                    CONF_EARLY_REFRESH_CANARY,
+                    default=config_entry.options.get(
+                        CONF_EARLY_REFRESH_CANARY, DEFAULT_EARLY_REFRESH_CANARY
+                    ),
+                ): cv.boolean,
+                vol.Optional(
+                    CONF_INVALID_GRANT_RECOVERY,
+                    default=config_entry.options.get(
+                        CONF_INVALID_GRANT_RECOVERY, DEFAULT_INVALID_GRANT_RECOVERY
+                    ),
                 ): cv.boolean,
             }
         )

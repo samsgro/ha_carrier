@@ -2,7 +2,7 @@
 
 from homeassistant.const import CONF_PASSWORD, CONF_UNIQUE_ID, CONF_USERNAME, Platform
 
-VERSION: str = "2.28.2+oauthdiag.2"
+VERSION: str = "2.28.2+oauthdiag.3"
 
 # Configuration Constants
 DOMAIN: str = "ha_carrier"
@@ -18,6 +18,10 @@ PLATFORMS: list[Platform] = [
 
 CONF_INFINITE_HOLDS: str = "infinite_holds"
 DEFAULT_INFINITE_HOLDS: bool = True
+CONF_EARLY_REFRESH_CANARY: str = "early_refresh_canary"
+CONF_INVALID_GRANT_RECOVERY: str = "invalid_grant_recovery"
+DEFAULT_EARLY_REFRESH_CANARY: bool = False
+DEFAULT_INVALID_GRANT_RECOVERY: bool = False
 
 FAN_AUTO = "auto"
 

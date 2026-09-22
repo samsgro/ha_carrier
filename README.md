@@ -92,14 +92,15 @@ The integration adds a Home Assistant device per Carrier system, with entities f
 
 1. Continue with [Configuration](#configuration) below.
 
-### Diagnostic fork (`2.28.2+oauthdiag.2`)
+### Diagnostic fork (`2.28.2+oauthdiag.3`)
 
-This fork does **not** change thermostat entities, config flow, or setpoints.
-It pins `carrier-api 3.6.0+oauthdiag.2` at immutable commit
-`af96d9514a71a6050e6642e9e12d553bf7f41c08` so Home Assistant can log
-secret-safe OAuth refresh diagnostics (status, content type, body class,
-length/hash, allowlisted OAuth error fields, and request IDs). Token refresh
-reads the OAuth JSON/body before aiohttp `raise_for_status` can release it.
+This fork does **not** change thermostat entity logic or config-flow identity.
+It pins `carrier-api 3.6.0+oauthdiag.3` at immutable commit
+`f7c22aa8ac505984653cbde3ff21ae03cd254b47`. Always-on: token lock and atomic
+token-pair install. Two options stay **off by default**: the diagnostic early
+refresh canary and experimental `invalid_grant` recovery. Recovery must stay
+off until the live evidence table selects it. Lock-layer regressions need a
+hard pin rollback to `oauthdiag.2`; option toggles do not undo the lock.
 
 See [DIAGNOSTIC_INSTALL.md](DIAGNOSTIC_INSTALL.md) for install and rollback
 steps. Do not use this branch's automated `carrier-api==` pin updater; the
@@ -131,6 +132,8 @@ manifest uses a git SHA on purpose.
 After setup, click **Configure** on the integration to change:
 
 - **Infinite holds** (default: on) — when on, manual changes from Home Assistant hold until you choose **Resume**. When off, holds expire at the next scheduled activity transition on your thermostat.
+- **Diagnostic early refresh canary** (default: off, experimental) — one refresh-token grant 30–60 seconds after login. A failed canary does not discard a valid access token or start reauth.
+- **Experimental invalid_grant recovery** (default: off) — keep this off until the oauthdiag.3 evidence table selects recovery.
 
 ### Re-authentication
 

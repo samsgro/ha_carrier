@@ -145,8 +145,27 @@ Short form:
 Rollback: restore upstream `ha_carrier` v2.28.2 and
 `carrier-api==3.6.0` from PyPI, then restart.
 
-## What's left
+## What's left (`oauthdiag.2`)
 
 - Deploy to Home Assistant only when Sam asks.
 - No upstream PRs.
 - No release.
+
+---
+
+## oauthdiag.3 follow-up
+
+Date: 2026-09-21  
+Worker: Orca dispatched builder (`task_3fc4d6ec0841`)
+
+`ha_carrier` `2.28.2+oauthdiag.3` pins `carrier_api`
+`3.6.0+oauthdiag.3` at immutable commit
+`f7c22aa8ac505984653cbde3ff21ae03cd254b47`. Setup passes the two
+default-off options and a `schedule_fn` only. Unload awaits
+`api_connection.cleanup()` before platform unload. Diagnostics may
+include a redacted `oauth_session` block. Climate entity logic is
+unchanged. Recovery stays off by default.
+
+Lock-layer regressions require hard pin rollback to `oauthdiag.2`
+(`af96d9514a71a6050e6642e9e12d553bf7f41c08`). Option toggles do not
+revert lock/atomicity.

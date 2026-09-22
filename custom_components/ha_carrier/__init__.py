@@ -1,6 +1,7 @@
 """Initialize and manage the Home Assistant Carrier integration lifecycle."""
 
 import asyncio
+from collections.abc import Awaitable
 import logging
 
 from carrier_api import ApiConnectionGraphql, CarrierApiConnectionError
@@ -12,7 +13,11 @@ from homeassistant.helpers import config_validation as cv
 
 from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator
 from .const import (
+    CONF_EARLY_REFRESH_CANARY,
+    CONF_INVALID_GRANT_RECOVERY,
     CONFIG_FLOW_VERSION,
+    DEFAULT_EARLY_REFRESH_CANARY,
+    DEFAULT_INVALID_GRANT_RECOVERY,
     DOMAIN,
     PLATFORMS,
     RETRY_JITTER_FRACTION,
@@ -96,9 +101,38 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
     )
     username = config_entry.data[CONF_USERNAME]
     password = config_entry.data[CONF_PASSWORD]
+    options = config_entry.options
+
+    def _schedule(coro: Awaitable[None]) -> asyncio.Task[None]:
+        """Schedule a connection-owned OAuth task on the Home Assistant loop.
+
+        Args:
+            coro: Canary or pre-expiry coroutine owned by the API connection.
+
+        Returns:
+            Background task handle stored by the connection.
+        """
+
+        async def _runner() -> None:
+            """Await the connection-owned coroutine on the Home Assistant loop."""
+            await coro
+
+        return hass.async_create_background_task(
+            _runner(), f"{DOMAIN}_oauth_{config_entry.entry_id}"
+        )
 
     try:
-        api_connection = ApiConnectionGraphql(username=username, password=password)
+        api_connection = ApiConnectionGraphql(
+            username=username,
+            password=password,
+            early_refresh_canary=options.get(
+                CONF_EARLY_REFRESH_CANARY, DEFAULT_EARLY_REFRESH_CANARY
+            ),
+            invalid_grant_recovery=options.get(
+                CONF_INVALID_GRANT_RECOVERY, DEFAULT_INVALID_GRANT_RECOVERY
+            ),
+            schedule_fn=_schedule,
+        )
         coordinator = CarrierDataUpdateCoordinator(
             hass=hass,
             api_connection=api_connection,
@@ -267,11 +301,16 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntryCarri
         bool: True when all platforms were unloaded cleanly.
     """
     _LOGGER.debug("unload entry")
-    websocket_task = config_entry.runtime_data.websocket_task
+    coordinator = config_entry.runtime_data
+    try:
+        await coordinator.api_connection.cleanup()
+    except CarrierApiConnectionError:
+        _LOGGER.exception("Failed to clean up Carrier API connection during unload")
+    websocket_task = coordinator.websocket_task
 
     if websocket_task is not None:
         websocket_task.cancel()
         await _async_await_websocket_task(websocket_task)
-        config_entry.runtime_data.websocket_task = None
+        coordinator.websocket_task = None
 
     return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)

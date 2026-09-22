@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,16 @@ class FakeCarrierApiConnection:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.load_data_error: BaseException | None = None
         self.cleanup_calls = 0
+        self.constructor_kwargs: dict[str, Any] = {}
+        self.early_refresh_canary = False
+        self.invalid_grant_recovery = False
+        self.schedule_fn: Callable[[Coroutine[object, object, None]], asyncio.Task[None]] | None = (
+            None
+        )
+        self._canary_task: asyncio.Task[None] | None = None
+        self._pre_expiry_task: asyncio.Task[None] | None = None
+        self._closing = False
+        self.refresh_posts_after_cleanup = 0
 
     async def load_data(self) -> list[System]:
         """Return configured systems or raise a configured load error."""
@@ -101,9 +112,47 @@ class FakeCarrierApiConnection:
         self.calls.append(("update_entry_level_zone", {"serial": serial, "index": index, **kwargs}))
         return {"updateEntryLevelZone": {"success": True}}
 
+    def apply_oauth_options(self, **kwargs: Any) -> None:
+        """Record constructor flags injected by Home Assistant setup.
+
+        Args:
+            kwargs: Extra ``ApiConnectionGraphql`` keyword arguments.
+        """
+        self.constructor_kwargs = kwargs
+        self.early_refresh_canary = bool(kwargs.get("early_refresh_canary", False))
+        self.invalid_grant_recovery = bool(kwargs.get("invalid_grant_recovery", False))
+        schedule_fn = kwargs.get("schedule_fn")
+        self.schedule_fn = schedule_fn if callable(schedule_fn) else None
+
+    def token_session_diagnostics(self) -> dict[str, Any]:
+        """Return a redacted token-session snapshot for diagnostics tests.
+
+        Returns:
+            Allowlisted flag and state fields with no secrets.
+        """
+        return {
+            "early_refresh_canary": self.early_refresh_canary,
+            "invalid_grant_recovery": self.invalid_grant_recovery,
+            "state": "ACTIVE",
+            "generation": 1,
+            "seconds_until_expiry": 3600.0,
+            "last_event": "login_committed",
+            "last_outcome": "success",
+            "refresh_fp12": "abc123def456",
+        }
+
     async def cleanup(self) -> None:
-        """Record credential-validation cleanup."""
+        """Cancel connection-owned OAuth tasks and record cleanup."""
+        self._closing = True
         self.cleanup_calls += 1
+        tasks = [task for task in (self._canary_task, self._pre_expiry_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._canary_task = None
+        self._pre_expiry_task = None
 
     async def get_user_info(self) -> dict[str, Any]:
         """Return the fake Carrier account identity payload."""
@@ -502,10 +551,13 @@ def patch_carrier_api(
         FakeCarrierApiConnection: The patched fake API object.
     """
 
-    def build_connection(*, username: str, password: str) -> FakeCarrierApiConnection:
-        """Return the test fake while recording supplied credentials."""
+    def build_connection(
+        *, username: str, password: str, **kwargs: Any
+    ) -> FakeCarrierApiConnection:
+        """Return the test fake while recording supplied credentials and flags."""
         carrier_api.username = username
         carrier_api.password = password
+        carrier_api.apply_oauth_options(**kwargs)
         return carrier_api
 
     with (

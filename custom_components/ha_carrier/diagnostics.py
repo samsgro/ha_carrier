@@ -28,8 +28,8 @@ async def async_get_config_entry_diagnostics(
     """Collect redacted integration diagnostics for a config entry.
 
     The diagnostics include config entry data, mapped system snapshots, raw
-    Carrier payloads, and Home Assistant device/entity state linked to each
-    Carrier serial.
+    Carrier payloads, Home Assistant device/entity state linked to each
+    Carrier serial, and an optional redacted ``oauth_session`` block.
 
     Args:
         hass: Home Assistant instance.
@@ -43,6 +43,9 @@ async def async_get_config_entry_diagnostics(
     data = {
         "entry": async_redact_data(config_entry.as_dict(), TO_REDACT),
     }
+    token_session = getattr(updater.api_connection, "token_session_diagnostics", None)
+    if callable(token_session):
+        data["oauth_session"] = token_session()
     for carrier_system in updater.systems:
         system_data = {
             "mapped_data": async_redact_data(
