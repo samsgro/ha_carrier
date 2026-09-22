@@ -42,9 +42,7 @@
       "init": {
         "title": "Carrier Infinity: Configuration",
         "data": {
-          "infinite_holds": "Holds are infinite, when off holds are until next scheduled activity",
-          "early_refresh_canary": "Diagnostic early refresh canary (experimental; default off). Measures whether a fresh login refresh token works 30-60 seconds later. A failed canary does not discard a valid access token or start reauth.",
-          "invalid_grant_recovery": "Experimental invalid_grant recovery (default off). Keep this off until the oauthdiag.3 evidence table selects recovery. Option toggles do not undo lock/atomicity; lock-layer regressions need a hard pin rollback to oauthdiag.2."
+          "infinite_holds": "Holds are infinite, when off holds are until next scheduled activity"
         }
       }
     }

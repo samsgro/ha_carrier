@@ -14,7 +14,7 @@
     "carrier_api"
   ],
   "requirements": [
-    "carrier-api @ git+https://github.com/samsgro/carrier_api.git@f7c22aa8ac505984653cbde3ff21ae03cd254b47"
+    "carrier-api @ git+https://github.com/samsgro/carrier_api.git@bf759dcd7a5fe839202377559e2d16ede1c934bb"
   ],
-  "version": "2.28.2+oauthdiag.3"
+  "version": "2.28.2+oauthfix.1"
 }

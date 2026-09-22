@@ -92,15 +92,15 @@ The integration adds a Home Assistant device per Carrier system, with entities f
 
 1. Continue with [Configuration](#configuration) below.
 
-### Diagnostic fork (`2.28.2+oauthdiag.3`)
+### Production fix (`2.28.2+oauthfix.1`)
 
 This fork does **not** change thermostat entity logic or config-flow identity.
-It pins `carrier-api 3.6.0+oauthdiag.3` at immutable commit
-`f7c22aa8ac505984653cbde3ff21ae03cd254b47`. Always-on: token lock and atomic
-token-pair install. Two options stay **off by default**: the diagnostic early
-refresh canary and experimental `invalid_grant` recovery. Recovery must stay
-off until the live evidence table selects it. Lock-layer regressions need a
-hard pin rollback to `oauthdiag.2`; option toggles do not undo the lock.
+It pins `carrier-api 3.6.0+oauthfix.1` at an immutable local commit. Always-on:
+token lock, atomic token-pair install, and `invalid_grant` recovery. At
+access-token expiry the library attempts the refresh grant once. HTTP 400
+`invalid_grant` or token-endpoint HTTP 401/403 falls back to up to three
+`assistedLogin` attempts. The early-refresh canary, pre-expiry scheduler, and
+OAuth experiment options are gone. Stale stored option keys are ignored.
 
 See [DIAGNOSTIC_INSTALL.md](DIAGNOSTIC_INSTALL.md) for install and rollback
 steps. Do not use this branch's automated `carrier-api==` pin updater; the
@@ -132,8 +132,6 @@ manifest uses a git SHA on purpose.
 After setup, click **Configure** on the integration to change:
 
 - **Infinite holds** (default: on) — when on, manual changes from Home Assistant hold until you choose **Resume**. When off, holds expire at the next scheduled activity transition on your thermostat.
-- **Diagnostic early refresh canary** (default: off, experimental) — one refresh-token grant 30–60 seconds after login. A failed canary does not discard a valid access token or start reauth.
-- **Experimental invalid_grant recovery** (default: off) — keep this off until the oauthdiag.3 evidence table selects recovery.
 
 ### Re-authentication
 

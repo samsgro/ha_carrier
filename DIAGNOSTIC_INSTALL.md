@@ -1,96 +1,95 @@
-# Diagnostic fork install and rollback
+# Production-fix install and rollback
 
-This branch is `2.28.2+oauthdiag.3`. It is a diagnostic/fix fork of
+This branch is `2.28.2+oauthfix.1`. It is a production-fix fork of
 `ha_carrier` v2.28.2. Thermostat entity logic and config-flow identity
-are unchanged. The library pin is `carrier-api 3.6.0+oauthdiag.3` at an
+are unchanged. The library pin is `carrier-api 3.6.0+oauthfix.1` at an
 immutable git SHA.
 
-Always-on in this fork: token lock, single-flight refresh, and atomic
-`TokenPair` install. Two **independently default-off** options:
-
-- `early_refresh_canary` — one diagnostic refresh 30–60 seconds after login
-- `invalid_grant_recovery` — `assistedLogin` fallback after a permanent
-  refresh rejection
-
-Recovery must stay off until the live evidence table in
-`home-automation/reports/Carrier OAuth early-refresh canary implementation plan.md`
-selects Path R.
+Always-on in this fork: token lock, single-flight refresh, atomic
+`TokenPair` install, and `invalid_grant` recovery. Early-refresh canary,
+pre-expiry scheduling, and OAuth experiment options are removed. Stale
+stored option keys (`early_refresh_canary`, `invalid_grant_recovery`)
+may remain in a config entry until the options form is next saved;
+runtime code ignores them.
 
 ## Pins
 
 | Item | Value |
 | --- | --- |
-| `ha_carrier` version | `2.28.2+oauthdiag.3` |
-| `carrier-api` version | `3.6.0+oauthdiag.3` |
-| Immutable `carrier-api` commit | `f7c22aa8ac505984653cbde3ff21ae03cd254b47` |
+| `ha_carrier` version | `2.28.2+oauthfix.1` |
+| `carrier-api` version | `3.6.0+oauthfix.1` |
+| Immutable `carrier-api` commit | `bf759dcd7a5fe839202377559e2d16ede1c934bb` |
 | `carrier-api` fork | https://github.com/samsgro/carrier_api/tree/oauth-refresh-diagnostics |
 | `ha_carrier` fork | https://github.com/samsgro/ha_carrier/tree/oauth-refresh-diagnostics |
 
 Manifest requirement:
 
 ```text
-carrier-api @ git+https://github.com/samsgro/carrier_api.git@f7c22aa8ac505984653cbde3ff21ae03cd254b47
+carrier-api @ git+https://github.com/samsgro/carrier_api.git@bf759dcd7a5fe839202377559e2d16ede1c934bb
 ```
 
 That requirement is a PEP 508 direct URL pin. Home Assistant will install it
 on the next integration setup or dependency repair. It is not the published
 PyPI `carrier-api==3.6.0` wheel.
 
-## What this fork adds
+## Production behavior
 
-`oauthdiag.2` secret-safe OAuth refresh diagnostics are unchanged: HTTP
-status, Content-Type, body class, length/SHA-256, allowlisted OAuth
-`error` / `error_description`, and allowlisted request IDs. Logs never
-include username, password, tokens, cookies, request bodies,
-`Authorization`, arbitrary headers, or the raw response body.
+At access-token expiry the library attempts the refresh grant once. On
+HTTP 400 `invalid_grant` or token-endpoint HTTP 401/403 it suppresses
+that refresh token and runs up to three `assistedLogin` attempts with 1s
+then 3s backoff. Transient transport, timeout, GraphQL transport/server,
+and malformed successful-token payload failures retry. Explicit
+`assistedLogin success=false` is credential rejection and starts Home
+Assistant reauthentication. `invalid_client` and `unauthorized_client`
+never fall back to login. Three transient login failures keep the atomic
+token pair, keep the dead refresh fingerprint suppressed, and raise a
+retryable connection/token-refresh error.
 
-`oauthdiag.3` adds a second allowlisted line for token-session
-orchestration (`Carrier OAuth token session ...`) plus the lock/atomicity
-layer. A failed canary does not write tokens and does not start Home
-Assistant reauth.
+Secret-safe OAuth refresh diagnostics are unchanged: HTTP status,
+Content-Type, body class, length/SHA-256, allowlisted OAuth `error` /
+`error_description`, and allowlisted request IDs. Logs never include
+username, password, tokens, cookies, request bodies, `Authorization`,
+arbitrary headers, or the raw response body.
 
 ## Manual install into Home Assistant
 
-Do this only when Sam is ready to deploy. This document does not restart or
-reconfigure Home Assistant.
+Do this only when Sam is ready to deploy. This document does not restart
+or reconfigure Home Assistant.
 
-1. Copy `custom_components/ha_carrier` from this branch over the installed
-   integration, typically
-   `/config/custom_components/ha_carrier`.
-2. Confirm `manifest.json` `version` is `2.28.2+oauthdiag.3` and
-   `requirements` contains the git SHA above.
-3. Restart Home Assistant (or repair the integration dependencies) so pip
+1. Take a fresh Home Assistant backup.
+2. Copy `custom_components/ha_carrier` from this branch over the installed
+   integration, typically `/config/custom_components/ha_carrier`.
+3. Confirm `manifest.json` `version` is `2.28.2+oauthfix.1` and
+   `requirements` contains the git SHA from this branch.
+4. Restart Home Assistant (or repair the integration dependencies) so pip
    installs the pinned `carrier-api` commit.
-4. Confirm the loaded package version is `3.6.0+oauthdiag.3`.
-5. Leave both new options off for the first observation window.
+5. Confirm the loaded package version is `3.6.0+oauthfix.1`.
+6. Observe at least two expiry cycles for one refresh rejection followed
+   by first-attempt assisted-login success, no outage, no storm, and no
+   reauth.
 
-To install just the library in a clean Python 3.14 environment:
+To install just the library in a clean Python 3.14 environment, use the
+SHA from `manifest.json`:
 
 ```bash
 python3.14 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install \
-  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@f7c22aa8ac505984653cbde3ff21ae03cd254b47"
+  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@bf759dcd7a5fe839202377559e2d16ede1c934bb"
 .venv/bin/python -c "from carrier_api.const import VERSION; print(VERSION)"
 ```
 
-Expected print: `3.6.0+oauthdiag.3`.
+Expected print: `3.6.0+oauthfix.1`.
 
 ## Rollback
 
-Turning both options off and reloading is the **soft** rollback. Use it
-only when the regression is canary- or recovery-flag behavior.
+There is no option toggle for recovery. Use a hard pin rollback.
 
-**Lock-layer regressions require a hard pin rollback.** Mixed pairs, a
-stuck lock, flags-off entity loss, or unexpected `invalid_grant` from a
-reused refresh token that the lock should have prevented are not fixed by
-option toggles. Restore `oauthdiag.2` or upstream v2.28.2.
+Hard rollback to `oauthdiag.3`:
 
-Hard rollback to `oauthdiag.2`:
-
-1. Replace `custom_components/ha_carrier` with `2.28.2+oauthdiag.2`.
-2. Confirm `manifest.json` has `"version": "2.28.2+oauthdiag.2"` and
-   `carrier-api` pin `af96d9514a71a6050e6642e9e12d553bf7f41c08`.
+1. Replace `custom_components/ha_carrier` with `2.28.2+oauthdiag.3`.
+2. Confirm `manifest.json` has `"version": "2.28.2+oauthdiag.3"` and
+   `carrier-api` pin `f7c22aa8ac505984653cbde3ff21ae03cd254b47`.
 3. Restart Home Assistant.
 
 Hard rollback to published upstream:
@@ -102,11 +101,11 @@ Hard rollback to published upstream:
    `"carrier-api==3.6.0"`.
 3. Restart Home Assistant so it reinstalls `carrier-api==3.6.0` from PyPI.
 
-Library-only rollback to `oauthdiag.2`:
+Library-only rollback to `oauthdiag.3`:
 
 ```bash
 .venv/bin/python -m pip install --force-reinstall \
-  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@af96d9514a71a6050e6642e9e12d553bf7f41c08"
+  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@f7c22aa8ac505984653cbde3ff21ae03cd254b47"
 ```
 
 Library-only rollback to published upstream:
@@ -115,4 +114,4 @@ Library-only rollback to published upstream:
 .venv/bin/python -m pip install --force-reinstall "carrier-api==3.6.0"
 ```
 
-No upstream pull request is opened by this diagnostic work.
+No upstream pull request is opened by this production-fix work.
