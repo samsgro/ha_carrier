@@ -1,8 +1,8 @@
 # Production-fix install and rollback
 
-This branch is `2.28.2+oauthfix.1`. It is a production-fix fork of
+This branch is `2.28.2+oauthfix.2`. It is a production-fix fork of
 `ha_carrier` v2.28.2. Thermostat entity logic and config-flow identity
-are unchanged. The library pin is `carrier-api 3.6.0+oauthfix.1` at an
+are unchanged. The library pin is `carrier-api 3.6.0+oauthfix.2` at an
 immutable git SHA.
 
 Always-on in this fork: token lock, single-flight refresh, atomic
@@ -16,16 +16,16 @@ runtime code ignores them.
 
 | Item | Value |
 | --- | --- |
-| `ha_carrier` version | `2.28.2+oauthfix.1` |
-| `carrier-api` version | `3.6.0+oauthfix.1` |
-| Immutable `carrier-api` commit | `2996935ba39ede773c6211e6de51cfa6a52cc0c8` |
+| `ha_carrier` version | `2.28.2+oauthfix.2` |
+| `carrier-api` version | `3.6.0+oauthfix.2` |
+| Immutable `carrier-api` commit | `be178e24841c1fdc8883f41859748d9a2c699d61` |
 | `carrier-api` fork | https://github.com/samsgro/carrier_api/tree/oauth-refresh-diagnostics |
 | `ha_carrier` fork | https://github.com/samsgro/ha_carrier/tree/oauth-refresh-diagnostics |
 
 Manifest requirement:
 
 ```text
-carrier-api @ git+https://github.com/samsgro/carrier_api.git@2996935ba39ede773c6211e6de51cfa6a52cc0c8
+carrier-api @ git+https://github.com/samsgro/carrier_api.git@be178e24841c1fdc8883f41859748d9a2c699d61
 ```
 
 That requirement is a PEP 508 direct URL pin. Home Assistant will install it
@@ -59,11 +59,11 @@ or reconfigure Home Assistant.
 1. Take a fresh Home Assistant backup.
 2. Copy `custom_components/ha_carrier` from this branch over the installed
    integration, typically `/config/custom_components/ha_carrier`.
-3. Confirm `manifest.json` `version` is `2.28.2+oauthfix.1` and
+3. Confirm `manifest.json` `version` is `2.28.2+oauthfix.2` and
    `requirements` contains the git SHA from this branch.
 4. Restart Home Assistant (or repair the integration dependencies) so pip
    installs the pinned `carrier-api` commit.
-5. Confirm the loaded package version is `3.6.0+oauthfix.1`.
+5. Confirm the loaded package version is `3.6.0+oauthfix.2`.
 6. Observe at least two expiry cycles for one refresh rejection followed
    by first-attempt assisted-login success, no outage, no storm, and no
    reauth.
@@ -75,11 +75,11 @@ SHA from `manifest.json`:
 python3.14 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install \
-  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@2996935ba39ede773c6211e6de51cfa6a52cc0c8"
+  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@be178e24841c1fdc8883f41859748d9a2c699d61"
 .venv/bin/python -c "from carrier_api.const import VERSION; print(VERSION)"
 ```
 
-Expected print: `3.6.0+oauthfix.1`.
+Expected print: `3.6.0+oauthfix.2`.
 
 ## Rollback
 

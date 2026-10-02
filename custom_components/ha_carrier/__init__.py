@@ -105,6 +105,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
         coordinator = CarrierDataUpdateCoordinator(
             hass=hass,
             api_connection=api_connection,
+            config_entry=config_entry,
         )
         await coordinator.async_config_entry_first_refresh()
         config_entry.runtime_data = coordinator
@@ -125,13 +126,19 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
             """
             attempt = 0
             while True:
+                api_websocket = None
                 try:
                     _LOGGER.debug("websocket task listening")
                     api_websocket = coordinator.api_connection.api_websocket
                     if api_websocket is None:
                         raise RuntimeError("Carrier API websocket client is not initialized")
                     await api_websocket.listener()
-                    _LOGGER.debug("websocket task ending")
+                    _LOGGER.warning(
+                        "Carrier websocket closed; close_code=%s; requesting full refresh "
+                        "(attempt %s)",
+                        getattr(api_websocket, "last_close_code", None),
+                        attempt + 1,
+                    )
                     coordinator.data_flush = True
                     await coordinator.async_request_refresh()
                 except asyncio.CancelledError:
@@ -139,6 +146,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
                     raise
                 except WEBSOCKET_RECOVERABLE_EXCEPTIONS as error:
                     delay = compute_backoff_delay(WEBSOCKET_RETRY_POLICY, attempt)
+                    _LOGGER.warning(
+                        "Carrier websocket closed; close_code=%s; requesting full refresh "
+                        "(attempt %s)",
+                        getattr(api_websocket, "last_close_code", None),
+                        attempt + 1,
+                    )
                     _LOGGER.debug(
                         "websocket task hit %s; requesting refresh and retrying in %.1f "
                         "seconds (attempt %d)",
@@ -152,6 +165,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
                     attempt += 1
                 except WEBSOCKET_DATA_UPDATE_EXCEPTIONS as error:
                     delay = compute_backoff_delay(WEBSOCKET_RETRY_POLICY, attempt)
+                    _LOGGER.warning(
+                        "Carrier websocket closed; close_code=%s; requesting full refresh "
+                        "(attempt %s)",
+                        getattr(api_websocket, "last_close_code", None),
+                        attempt + 1,
+                    )
                     _LOGGER.exception(
                         "websocket data update failed with %s; requesting refresh and "
                         "retrying in %.1f seconds (attempt %d)",
@@ -281,5 +300,11 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntryCarri
         websocket_task.cancel()
         await _async_await_websocket_task(websocket_task)
         coordinator.websocket_task = None
+
+    probe_task = coordinator.reauth_probe_task
+    if probe_task is not None:
+        probe_task.cancel()
+        await _async_await_websocket_task(probe_task)
+        coordinator.reauth_probe_task = None
 
     return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)

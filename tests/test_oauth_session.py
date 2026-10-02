@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from carrier_api import CarrierApiAuthError
+from carrier_api import CarrierApiAuthError, CarrierApiTokenRefreshError
 from homeassistant.components.climate import (
     ATTR_HVAC_MODE,
     DOMAIN as CLIMATE_DOMAIN,
@@ -30,7 +30,6 @@ from custom_components.ha_carrier.const import (
     UNAUTHORIZED_RETRY_THRESHOLD,
 )
 from custom_components.ha_carrier.diagnostics import async_get_config_entry_diagnostics
-from custom_components.ha_carrier.exceptions import CarrierUnauthorizedError
 from custom_components.ha_carrier.resiliency import ResiliencyState
 
 from .conftest import PASSWORD, USERNAME, FakeCarrierApiConnection, entity_id_for_unique_id
@@ -83,29 +82,31 @@ async def test_h2_stale_stored_option_keys_are_ignored(
 async def test_h4_three_expiry_auth_errors_still_reauth(
     carrier_api: FakeCarrierApiConnection,
 ) -> None:
-    """H4: repeated expiry AuthErrors still escalate to reauth."""
+    """H4: three generic AuthErrors do not reauth until Gap 3(a) reports login_failed."""
     coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
     coordinator.systems = carrier_api.systems
     coordinator.data_flush = True
     coordinator._websocket_initialized = True
+    coordinator.config_entry = None
+    coordinator.reauth_probe_task = None
+    coordinator._reauth_parked = False
     _set_coordinator_api_connection(coordinator, carrier_api)
     coordinator.resiliency = ResiliencyState(
         unauthorized_threshold=UNAUTHORIZED_RETRY_THRESHOLD,
         transient_threshold=5,
     )
     carrier_api.load_data_error = CarrierApiAuthError("invalid_grant")
-    saw_reauth = False
+    carrier_api.login_error = CarrierApiTokenRefreshError("transient login")
 
-    for _ in range(6):
-        try:
+    for _ in range(3):
+        with pytest.raises(UpdateFailed):
             await coordinator._async_update_data()
-        except ConfigEntryAuthFailed:
-            saw_reauth = True
-            break
-        except UpdateFailed:
-            continue
 
-    assert saw_reauth is True
+    carrier_api.login_error = CarrierApiAuthError("login failed", reason="login_failed")
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 4
 
 
 @pytest.mark.asyncio
@@ -128,20 +129,23 @@ async def test_h5_successful_load_does_not_reauth(
 
 @pytest.mark.asyncio
 async def test_h6_login_failure_follows_unauthorized_path(
-    monkeypatch: pytest.MonkeyPatch,
+    carrier_api: FakeCarrierApiConnection,
 ) -> None:
-    """H6: recovery login auth-failure still uses the existing reauth path."""
+    """H6: reason=login_failed still reauths after Gap 3(a) also fails login."""
     coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
     coordinator.data_flush = True
-
-    async def fake_full_refresh() -> None:
-        """Raise an escalated recovery login failure."""
-        raise CarrierUnauthorizedError("login_failed")
-
-    monkeypatch.setattr(coordinator, "_async_full_refresh", fake_full_refresh)
+    coordinator.config_entry = None
+    coordinator.reauth_probe_task = None
+    coordinator._reauth_parked = False
+    _set_coordinator_api_connection(coordinator, carrier_api)
+    coordinator.resiliency = ResiliencyState(unauthorized_threshold=3, transient_threshold=5)
+    carrier_api.load_data_error = CarrierApiAuthError("login failed", reason="login_failed")
+    carrier_api.login_error = CarrierApiAuthError("login failed", reason="login_failed")
 
     with pytest.raises(ConfigEntryAuthFailed):
         await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 1
 
 
 @pytest.mark.asyncio

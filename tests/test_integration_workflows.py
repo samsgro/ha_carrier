@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from inspect import isawaitable
 
-from carrier_api import CarrierApiConnectionError
+from carrier_api import CarrierApiAuthError, CarrierApiConnectionError
 from homeassistant import config_entries
 from homeassistant.components.climate import (
     ATTR_HVAC_MODE,
@@ -23,6 +24,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -263,6 +265,142 @@ async def test_registry_migration_workflow_preserves_entities_through_setup(
     assert migrated_climate.unique_id == "abc123_zone_1_thermostat"
     assert ent_reg.async_get_entity_id("sensor", DOMAIN, "ABC123_Outdoor Temperature") is None
     assert ent_reg.async_get_entity_id("climate", DOMAIN, "ABC123_Living Room") is None
+
+
+@pytest.mark.asyncio
+async def test_reauth_probe_reloads_and_aborts_flow_on_successful_login(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    setup_integration: Callable[..., Awaitable[ConfigEntry]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-heal a parked reauth probe by aborting the flow and reloading."""
+    config_entry = await setup_integration()
+    coordinator = config_entry.runtime_data
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    async def instant_probe_sleep(_delay: float) -> None:
+        """Skip the 30-minute probe interval without touching asyncio.sleep."""
+        return
+
+    monkeypatch.setattr(
+        "custom_components.ha_carrier.carrier_data_update_coordinator._async_reauth_probe_sleep",
+        instant_probe_sleep,
+    )
+    form = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_REAUTH, "entry_id": config_entry.entry_id},
+        data=config_entry.data,
+    )
+    assert form["type"] is FlowResultType.FORM
+
+    rejected = CarrierApiAuthError("access rejected", reason="access_rejected")
+    carrier_api.load_data_errors = [rejected, rejected]
+    coordinator.data_flush = True
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+    probe = coordinator.reauth_probe_task
+    if probe is not None and not probe.done():
+        await probe
+    await hass.async_block_till_done()
+
+    assert carrier_api.login_calls >= 2
+    progress = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert not any(
+        (item.get("context") or {}).get("source") == config_entries.SOURCE_REAUTH
+        for item in progress
+    )
+    assert config_entry.state is ConfigEntryState.LOADED
+
+
+@pytest.mark.asyncio
+async def test_reauth_probe_stays_idle_on_login_failed(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    setup_integration: Callable[..., Awaitable[ConfigEntry]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep probing after login_failed without reloading the entry."""
+    config_entry = await setup_integration()
+    coordinator = config_entry.runtime_data
+    first_coordinator = coordinator
+    carrier_api.login_error = CarrierApiAuthError("login failed", reason="login_failed")
+    carrier_api.load_data_error = CarrierApiAuthError("unauthorized")
+
+    async def sleep_until_two_probe_logins(_delay: float) -> None:
+        """Skip the probe interval and unpark after two failed probe logins."""
+        if carrier_api.login_calls >= 3:
+            coordinator._reauth_parked = False
+
+    monkeypatch.setattr(
+        "custom_components.ha_carrier.carrier_data_update_coordinator._async_reauth_probe_sleep",
+        sleep_until_two_probe_logins,
+    )
+    coordinator.data_flush = True
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+    probe = coordinator.reauth_probe_task
+    assert probe is not None
+
+    async def hold_updates() -> list[dict[str, object]]:
+        """Prevent a healthy refresh from unparking the probe mid-interval."""
+        raise UpdateFailed("hold coordinator refresh while the reauth probe runs")
+
+    monkeypatch.setattr(coordinator, "_async_update_data", hold_updates)
+    coordinator.update_interval = None
+    await probe
+    await hass.async_block_till_done()
+
+    assert carrier_api.login_calls >= 3
+    assert config_entry.runtime_data is first_coordinator
+    assert config_entry.state is ConfigEntryState.LOADED
+
+
+@pytest.mark.asyncio
+async def test_reauth_probe_cancelled_on_unload(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    setup_integration: Callable[..., Awaitable[ConfigEntry]],
+) -> None:
+    """Cancel the reauth probe during unload so it cannot linger."""
+    config_entry = await setup_integration()
+    coordinator = config_entry.runtime_data
+    coordinator._reauth_parked = True
+    coordinator._start_reauth_probe()
+    probe_task = coordinator.reauth_probe_task
+    assert probe_task is not None
+
+    await _async_unload_loaded_entry(hass, config_entry)
+
+    assert coordinator.reauth_probe_task is None
+    assert probe_task.cancelled() or probe_task.done()
+
+
+@pytest.mark.asyncio
+async def test_websocket_and_coordinator_refresh_share_one_client_recovery(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    setup_integration: Callable[..., Awaitable[ConfigEntry]],
+) -> None:
+    """Overlapping websocket and coordinator refreshes do not raise two reauths."""
+    monkeypatch.setattr("custom_components.ha_carrier.compute_backoff_delay", lambda *_: 0)
+    config_entry = await setup_integration()
+    coordinator = config_entry.runtime_data
+    carrier_api.calls.clear()
+    carrier_api.api_websocket.listener_errors.append(CarrierApiConnectionError("closed"))
+
+    await coordinator.async_request_refresh()
+    for _ in range(10):
+        await hass.async_block_till_done()
+        if carrier_api.api_websocket.listener_calls >= 2:
+            break
+        await asyncio.sleep(0)
+
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert coordinator.last_update_success is True
+    assert carrier_api.login_calls == 0
+    assert coordinator.reauth_probe_task is None
 
 
 async def _async_unload_loaded_entry(

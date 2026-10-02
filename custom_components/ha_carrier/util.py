@@ -190,6 +190,22 @@ def is_unauthorized_error(error: BaseException) -> bool:
     return False
 
 
+def is_credential_rejection(error: BaseException) -> bool:
+    """Return True when assistedLogin reported an explicit credential failure.
+
+    Args:
+        error: Exception raised by the Carrier client or transport.
+
+    Returns:
+        bool: True when any exception in the chain is ``CarrierApiAuthError``
+            with ``reason == "login_failed"``.
+    """
+    for current in _iter_exception_chain(error):
+        if isinstance(current, CarrierApiAuthError) and current.reason == "login_failed":
+            return True
+    return False
+
+
 def is_retryable_error(error: BaseException) -> bool:
     """Return True if any exception in the chain should be retried with backoff.
 

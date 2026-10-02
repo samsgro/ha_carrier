@@ -2,7 +2,7 @@
 
 from homeassistant.const import CONF_PASSWORD, CONF_UNIQUE_ID, CONF_USERNAME, Platform
 
-VERSION: str = "2.28.2+oauthfix.1"
+VERSION: str = "2.28.2+oauthfix.2"
 
 # Configuration Constants
 DOMAIN: str = "ha_carrier"
@@ -58,6 +58,7 @@ FULL_RECONCILE_INTERVAL_MINUTES: int = DEFAULT_UPDATE_INTERVAL_MINUTES * 4
 # apart by content — the window is the only reliable discriminator.
 POST_WRITE_INTERCEPT_WINDOW_MINUTES: int = 5
 UNAUTHORIZED_RETRY_THRESHOLD: int = 3
+REAUTH_LOGIN_PROBE_INTERVAL_MINUTES: int = 30
 MAX_WRITE_ATTEMPTS: int = 2
 
 WEBSOCKET_RETRY_INITIAL_DELAY_SECONDS: int = 1

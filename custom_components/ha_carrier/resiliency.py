@@ -59,11 +59,17 @@ class ResiliencyState:
     """Cross-call escalation counters shared across coordinator surfaces.
 
     Unauthorized and transient failures are tracked separately because they
-    escalate to different Home Assistant behavior: persistent 401s trigger
-    reauthentication, while persistent transport failures surface as retryable
-    update/write failures. A successful normal operation resets both counters.
-    Callers that need cycle-level accounting, such as per-system energy refresh,
-    can defer success resets and record the cycle result explicitly.
+    escalate to different Home Assistant behavior. The unauthorized counter
+    still drives write-path ``CarrierUnauthorizedError`` after
+    ``UNAUTHORIZED_RETRY_THRESHOLD``. Refresh reauth is **not** this counter;
+    the coordinator classifies ``ConfigEntryAuthFailed`` from assistedLogin
+    ``success=false`` or a 401 that persists after a successful recovery.
+    Persistent transport failures surface as retryable update/write failures.
+    A successful normal operation resets both counters. Callers that observe
+    a successful client recovery must call ``reset_unauthorized()`` (the
+    retry helper already does this on success). Callers that need cycle-level
+    accounting, such as per-system energy refresh, can defer success resets
+    and record the cycle result explicitly.
 
     Attributes:
         unauthorized_threshold: Consecutive 401 count that triggers escalation.
@@ -121,7 +127,7 @@ class ResiliencyState:
         """
         self.consecutive_unauthorized += 1
         if not self.unauthorized_outage_logged:
-            logger.info(
+            logger.warning(
                 "Carrier API returned unauthorized during %s; treating it as a transient blip.",
                 operation_name,
             )

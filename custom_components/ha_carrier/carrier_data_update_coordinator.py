@@ -7,8 +7,18 @@ import functools
 import logging
 from typing import Any, NoReturn
 
-from carrier_api import ApiConnectionGraphql, CarrierApiError, Energy, EntryLevelSystem, System
+from carrier_api import (
+    ApiConnectionGraphql,
+    CarrierApiAuthError,
+    CarrierApiConnectionError,
+    CarrierApiError,
+    CarrierApiTokenRefreshError,
+    Energy,
+    EntryLevelSystem,
+    System,
+)
 from carrier_api.api_websocket_data_updater import WebsocketDataUpdater
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.debounce import Debouncer
@@ -25,6 +35,7 @@ from .const import (
     MAX_REFRESH_ATTEMPTS,
     MAX_WRITE_ATTEMPTS,
     POST_WRITE_INTERCEPT_WINDOW_MINUTES,
+    REAUTH_LOGIN_PROBE_INTERVAL_MINUTES,
     REFRESH_RETRY_BASE_DELAY_SECONDS,
     REFRESH_RETRY_MAX_DELAY_SECONDS,
     RETRY_JITTER_FRACTION,
@@ -40,8 +51,21 @@ from .util import (
     RECOVERABLE_REFRESH_EXCEPTIONS,
     RECOVERABLE_WRITE_COMMUNICATION_EXCEPTIONS,
     async_redact_data,
+    is_credential_rejection,
     is_unauthorized_error,
 )
+
+_REAUTH_ESCALATION_REASONS = frozenset({"login_failed", "persisted_after_recovery"})
+
+
+async def _async_reauth_probe_sleep(delay: float) -> None:
+    """Sleep between reauth login probes.
+
+    Isolated so tests can skip the 30-minute interval without patching
+    global ``asyncio.sleep``.
+    """
+    await asyncio.sleep(delay)
+
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -79,15 +103,18 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         self,
         hass: HomeAssistant,
         api_connection: ApiConnectionGraphql,
+        config_entry: ConfigEntry | None = None,
     ) -> None:
         """Initialize coordinator state and refresh scheduling.
 
         Args:
             hass: Home Assistant instance used for task scheduling and callbacks.
             api_connection: Authenticated Carrier API connection wrapper.
+            config_entry: Config entry used to reload and abort reauth.
         """
         self.hass: HomeAssistant = hass
         self.api_connection: ApiConnectionGraphql = api_connection
+        self.config_entry: ConfigEntry | None = config_entry
         self.resiliency = ResiliencyState(
             unauthorized_threshold=UNAUTHORIZED_RETRY_THRESHOLD,
             transient_threshold=TRANSIENT_FAILURE_THRESHOLD,
@@ -96,6 +123,8 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         self.entry_level_systems: list[EntryLevelSystem] = []
         self.websocket_data_updater: WebsocketDataUpdater | None = None
         self.websocket_task: asyncio.Task[None] | None = None
+        self.reauth_probe_task: asyncio.Task[None] | None = None
+        self._reauth_parked = False
         self._websocket_initialized = False
         self.data_flush = True
         self.timestamp_all_data: datetime | None = None
@@ -106,6 +135,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=f"{DOMAIN}-{self.api_connection.username}",
             update_interval=timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES),
             always_update=False,
@@ -276,18 +306,18 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         Performs either a full system refresh or a lighter energy-only refresh,
         depending on whether the coordinator has been marked dirty. The shared
         `ResiliencyState` tracks 401 and transient failures across API calls.
-        Unauthorized failures only become `ConfigEntryAuthFailed` after a fresh
-        refresh attempt fails and crosses the shared threshold, so a later
-        successful refresh can still clear an old outage window. Non-escalated
-        refresh failures remain `UpdateFailed`, which lets Home Assistant retry
-        later.
+        Unauthorized failures run one final stored-credential ``login()``
+        before ``ConfigEntryAuthFailed``. Reauth is raised only when that
+        login reports ``success=false`` or a 401 persists after a successful
+        recovery produced a new generation. Transient login and token-refresh
+        failures remain ``UpdateFailed``.
 
         Returns:
             list[dict[str, Any]]: List of mappings representing tracked systems.
 
         Raises:
-            ConfigEntryAuthFailed: Raised when 401 responses cross the
-                unauthorized threshold; HA prompts reauth.
+            ConfigEntryAuthFailed: Raised when assistedLogin reports
+                ``success=false`` or a 401 persists after a successful recovery.
             UpdateFailed: Raised when transient failures escalate or refresh
                 cannot complete successfully for other reasons.
         """
@@ -307,34 +337,25 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
 
         try:
             await refresh_operation()
-            return [self.mapped_system_data(system) for system in self.systems]
-        except CarrierUnauthorizedError as error:
-            self.data_flush = True
-            self.update_interval = timedelta(minutes=1)
-            raise ConfigEntryAuthFailed(
-                "Carrier API rejected credentials; reauthentication required."
-            ) from error
         except (
             asyncio.CancelledError,
             KeyboardInterrupt,
             SystemExit,
         ):
             raise
-        except RECOVERABLE_REFRESH_EXCEPTIONS as error:
+        except (CarrierUnauthorizedError, *RECOVERABLE_REFRESH_EXCEPTIONS) as error:
+            if is_unauthorized_error(error):
+                return await self._async_final_login_then_retry(
+                    error, refresh_operation, refresh_context
+                )
             self.data_flush = True
             self.update_interval = timedelta(minutes=1)
-            if is_unauthorized_error(error):
-                _LOGGER.info(
-                    "Carrier %s returned unauthorized without crossing the reauth threshold.",
-                    refresh_context,
-                )
-                raise UpdateFailed(
-                    f"Carrier temporarily rejected {refresh_context}; will retry."
-                ) from error
             _LOGGER.exception("Carrier %s failed", refresh_context, exc_info=error)
             raise UpdateFailed(
                 f"Unexpected error during Carrier {refresh_context}: {error}"
             ) from error
+        self._stop_reauth_probe()
+        return [self.mapped_system_data(system) for system in self.systems]
 
     async def _async_full_refresh(self) -> None:
         """Load all Carrier systems through the normal retry path.
@@ -422,10 +443,13 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         normal polling interval.
 
         Raises:
-            CarrierUnauthorizedError: When 401s escalate beyond the threshold.
+            CarrierApiAuthError: When any system returns unauthorized. The
+                shared unauthorized counter is recorded once per cycle but
+                never converted to ``CarrierUnauthorizedError`` here; the
+                coordinator's single unauthorized handler owns Gap 3(a).
         """
         _LOGGER.debug("fetching energy data")
-        found_unauthorized = False
+        unauthorized_error: BaseException | None = None
         for system in self.systems:
             try:
                 energy_response = await async_call_with_retry(
@@ -440,21 +464,194 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             except ENERGY_REFRESH_EXCEPTIONS as error:
                 if not is_unauthorized_error(error):
                     raise
-                if not found_unauthorized:
-                    found_unauthorized = True
+                if unauthorized_error is None:
+                    unauthorized_error = error
                     self.update_interval = timedelta(minutes=1)
-                    if self.resiliency.record_unauthorized(_LOGGER, "energy refresh cycle"):
-                        raise CarrierUnauthorizedError(
-                            "Carrier API repeatedly rejected energy refresh requests."
-                        ) from error
+                    self.resiliency.record_unauthorized(_LOGGER, "energy refresh cycle")
                 continue
             energy = Energy(raw=energy_response["infinityEnergy"])
             system.energy = energy
-        if not found_unauthorized:
-            self.resiliency.reset_unauthorized()
-            self.resiliency.reset_transient()
-            self.timestamp_energy = datetime.now(UTC)
-            self.update_interval = timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
+        if unauthorized_error is not None:
+            raise unauthorized_error
+        self.resiliency.reset_unauthorized()
+        self.resiliency.reset_transient()
+        self.timestamp_energy = datetime.now(UTC)
+        self.update_interval = timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
+
+    def _login_reported_auth_failed(self, error: BaseException) -> bool:
+        """Return True when a login attempt reported credential rejection.
+
+        Args:
+            error: Exception raised by ``api_connection.login()``.
+
+        Returns:
+            bool: True when the error is ``login_failed`` or diagnostics
+                report ``AUTH_FAILED``.
+        """
+        if is_credential_rejection(error):
+            return True
+        diagnostics = getattr(self.api_connection, "token_session_diagnostics", None)
+        if callable(diagnostics):
+            snapshot = diagnostics()
+            if isinstance(snapshot, dict) and snapshot.get("state") == "AUTH_FAILED":
+                return True
+        return isinstance(error, CarrierApiAuthError)
+
+    def _emit_reauth_escalation(self, escalation_reason: str) -> None:
+        """Log a secret-safe reauth escalation warning.
+
+        Args:
+            escalation_reason: Allowlisted reason in
+                ``{login_failed, persisted_after_recovery}``.
+        """
+        reason = (
+            escalation_reason if escalation_reason in _REAUTH_ESCALATION_REASONS else "login_failed"
+        )
+        _LOGGER.warning(
+            "Carrier reauth_escalation event=reauth_escalation escalation_reason=%s",
+            reason,
+        )
+
+    def _entry_is_loaded(self) -> bool:
+        """Return True when this coordinator's config entry is fully loaded."""
+        entry = getattr(self, "config_entry", None)
+        return entry is not None and entry.state == ConfigEntryState.LOADED
+
+    def _start_reauth_probe(self) -> None:
+        """Start the 30-minute reauth login probe after a loaded-entry escalation.
+
+        The 30-minute probe starts only from runtime ``_async_update_data`` when
+        it raises ``ConfigEntryAuthFailed`` after the entry is loaded;
+        setup-time first-refresh auth failure runs Gap 3(a) once but must not
+        start the probe.
+        """
+        if not self._entry_is_loaded():
+            return
+        existing = getattr(self, "reauth_probe_task", None)
+        if existing is not None and not existing.done():
+            return
+        hass = getattr(self, "hass", None)
+        entry = getattr(self, "config_entry", None)
+        if hass is None or entry is None:
+            return
+        self._reauth_parked = True
+        self.reauth_probe_task = hass.async_create_background_task(
+            self._async_reauth_login_probe(),
+            f"{DOMAIN}_reauth_probe_{entry.entry_id}",
+        )
+
+    def _stop_reauth_probe(self) -> None:
+        """Cancel a running reauth probe and clear the parked flag."""
+        self._reauth_parked = False
+        task = getattr(self, "reauth_probe_task", None)
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        self.reauth_probe_task = None
+
+    async def _async_abort_reauth_flows(self) -> None:
+        """Abort in-progress reauth flows for this config entry."""
+        entry = getattr(self, "config_entry", None)
+        hass = getattr(self, "hass", None)
+        if entry is None or hass is None:
+            return
+        entry_id = entry.entry_id
+        for progress in hass.config_entries.flow.async_progress_by_handler(DOMAIN):
+            ctx = progress.get("context") or {}
+            if ctx.get("source") == SOURCE_REAUTH and ctx.get("entry_id") == entry_id:
+                hass.config_entries.flow.async_abort(progress["flow_id"])
+
+    async def _async_reauth_login_probe(self) -> None:
+        """Retry stored credentials every 30 minutes while parked in reauth."""
+        while True:
+            await _async_reauth_probe_sleep(REAUTH_LOGIN_PROBE_INTERVAL_MINUTES * 60)
+            if not getattr(self, "_reauth_parked", False):
+                return
+            api_connection = self.api_connection
+            if getattr(api_connection, "session_closing", False):
+                return
+            try:
+                await api_connection.login()
+            except CarrierApiAuthError:
+                continue
+            except CarrierApiTokenRefreshError, CarrierApiConnectionError:
+                continue
+            else:
+                await self._async_abort_reauth_flows()
+                entry = self.config_entry
+                if entry is None:
+                    return
+                entry_id = entry.entry_id
+                self._reauth_parked = False
+                self.hass.async_create_task(self.hass.config_entries.async_reload(entry_id))
+                return
+
+    async def _async_final_login_then_retry(
+        self,
+        error: BaseException,
+        refresh_operation: Callable[[], Awaitable[None]],
+        refresh_context: str,
+    ) -> list[dict[str, Any]]:
+        """Run one fresh stored-credential login, then retry or escalate.
+
+        Args:
+            error: Unauthorized error surfaced by the refresh operation.
+            refresh_operation: Full or energy refresh to retry after login.
+            refresh_context: Human-readable refresh path name for errors.
+
+        Returns:
+            list[dict[str, Any]]: Mapped system data when login and retry succeed.
+
+        Raises:
+            ConfigEntryAuthFailed: When login reports ``success=false`` or the
+                retried refresh is still unauthorized.
+            UpdateFailed: When login or the retried refresh is transient.
+        """
+        self.data_flush = True
+        self.update_interval = timedelta(minutes=1)
+        try:
+            await self.api_connection.login()
+        except CarrierApiAuthError as login_error:
+            if self._login_reported_auth_failed(login_error):
+                self._emit_reauth_escalation("login_failed")
+                self._start_reauth_probe()
+                raise ConfigEntryAuthFailed(
+                    "Carrier API rejected credentials; reauthentication required."
+                ) from login_error
+            raise UpdateFailed(
+                f"Carrier temporarily rejected {refresh_context}; will retry."
+            ) from login_error
+        except (CarrierApiTokenRefreshError, CarrierApiConnectionError) as login_error:
+            raise UpdateFailed(
+                f"Carrier temporarily rejected {refresh_context}; will retry."
+            ) from login_error
+
+        try:
+            await refresh_operation()
+        except (
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+        ):
+            raise
+        except Exception as retry_error:
+            if is_unauthorized_error(retry_error):
+                self._emit_reauth_escalation("persisted_after_recovery")
+                self._start_reauth_probe()
+                raise ConfigEntryAuthFailed(
+                    "Carrier API rejected credentials; reauthentication required."
+                ) from retry_error
+            if isinstance(retry_error, RECOVERABLE_REFRESH_EXCEPTIONS):
+                raise UpdateFailed(
+                    f"Unexpected error during Carrier {refresh_context}: {retry_error}"
+                ) from retry_error
+            raise
+
+        self.resiliency.reset()
+        self._reauth_parked = False
+        self._stop_reauth_probe()
+        return [self.mapped_system_data(system) for system in self.systems]
 
     async def _async_handle_failed_write(
         self,

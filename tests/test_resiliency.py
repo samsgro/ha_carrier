@@ -137,6 +137,48 @@ async def test_retry_helper_escalates_repeated_unauthorized_failures(
     assert state.consecutive_unauthorized == 2
 
 
+@pytest.mark.asyncio
+async def test_record_unauthorized_resets_when_operation_succeeds(
+    retry_policy: RetryPolicy,
+) -> None:
+    """Clear the unauthorized counter after a later successful retry-helper call."""
+    state = ResiliencyState(unauthorized_threshold=3, transient_threshold=3)
+    attempts = 0
+
+    async def operation() -> str:
+        """Fail once unauthorized, then succeed."""
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise CarrierApiAuthError("unauthorized")
+        return "ok"
+
+    result = await async_call_with_retry(
+        operation,
+        policy=retry_policy,
+        state=state,
+        operation_name="test operation",
+        logger=logging.getLogger(__name__),
+    )
+
+    assert result == "ok"
+    assert state.consecutive_unauthorized == 0
+
+
+def test_record_unauthorized_first_hit_is_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """Log the first unauthorized hit at WARNING without secrets."""
+    state = ResiliencyState(unauthorized_threshold=3, transient_threshold=3)
+    logger = logging.getLogger("ha_carrier.resiliency.test")
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        escalated = state.record_unauthorized(logger, "full data refresh")
+
+    assert escalated is False
+    assert any("unauthorized" in record.getMessage() for record in caplog.records)
+    assert "Token=" not in caplog.text
+    assert "password" not in caplog.text.lower()
+
+
 @pytest.mark.parametrize(
     ("attempt", "expected"),
     [(0, 1.0), (1, 2.0), (2, 4.0), (5, 4.0)],

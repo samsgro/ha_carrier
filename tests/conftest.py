@@ -33,6 +33,8 @@ class FakeCarrierWebsocket:
         self.callbacks: list[Callable[[str], Any]] = []
         self.listener_errors: list[BaseException] = []
         self.listener_calls = 0
+        self.last_close_code: int | None = None
+        self.listener_immediate_returns = 0
 
     def callback_add(self, callback: Callable[[str], Any]) -> None:
         """Store a websocket callback registered by the coordinator.
@@ -47,6 +49,9 @@ class FakeCarrierWebsocket:
         self.listener_calls += 1
         if self.listener_errors:
             raise self.listener_errors.pop(0)
+        if self.listener_immediate_returns > 0:
+            self.listener_immediate_returns -= 1
+            return
         await asyncio.Event().wait()
 
 
@@ -80,14 +85,31 @@ class FakeCarrierApiConnection:
         self.api_websocket = FakeCarrierWebsocket()
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.load_data_error: BaseException | None = None
+        self.load_data_errors: list[BaseException] = []
+        self.login_calls = 0
+        self.login_error: BaseException | None = None
         self.cleanup_calls = 0
         self.constructor_kwargs: dict[str, Any] = {}
         self._closing = False
         self.refresh_posts_after_cleanup = 0
 
+    @property
+    def session_closing(self) -> bool:
+        """Return whether cleanup has started, matching the production property."""
+        return self._closing
+
+    async def login(self) -> None:
+        """Record a stored-credential login or raise a configured login error."""
+        self.calls.append(("login", {}))
+        self.login_calls += 1
+        if self.login_error is not None:
+            raise self.login_error
+
     async def load_data(self) -> list[System]:
         """Return configured systems or raise a configured load error."""
         self.calls.append(("load_data", {}))
+        if self.load_data_errors:
+            raise self.load_data_errors.pop(0)
         if self.load_data_error is not None:
             raise self.load_data_error
         return self.systems
@@ -535,6 +557,7 @@ def patch_carrier_api(
         """Return the test fake while recording supplied credentials and flags."""
         carrier_api.username = username
         carrier_api.password = password
+        carrier_api._closing = False
         carrier_api.apply_oauth_options(**kwargs)
         return carrier_api
 

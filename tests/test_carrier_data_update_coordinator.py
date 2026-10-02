@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from carrier_api import CarrierApiAuthError, CarrierApiConnectionError, CarrierApiGraphqlError
+from carrier_api import (
+    CarrierApiAuthError,
+    CarrierApiConnectionError,
+    CarrierApiGraphqlError,
+    CarrierApiTokenRefreshError,
+)
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
 import pytest
@@ -32,6 +41,21 @@ def _set_coordinator_api_connection(
 ) -> None:
     """Attach a fake API connection to a partially constructed coordinator."""
     object.__setattr__(coordinator, "api_connection", api_connection)
+
+
+def _attach_reauth_runtime(
+    coordinator: CarrierDataUpdateCoordinator,
+    api_connection: FakeCarrierApiConnection,
+) -> None:
+    """Attach Gap 3 runtime fields used by unauthorized classification."""
+    _set_coordinator_api_connection(coordinator, api_connection)
+    coordinator.config_entry = None
+    coordinator.reauth_probe_task = None
+    coordinator._reauth_parked = False
+    coordinator.resiliency = ResiliencyState(
+        unauthorized_threshold=UNAUTHORIZED_RETRY_THRESHOLD,
+        transient_threshold=TRANSIENT_FAILURE_THRESHOLD,
+    )
 
 
 @pytest.mark.asyncio
@@ -220,10 +244,165 @@ async def test_carrier_api_write_rejection_reconciles_and_raises_ha_error() -> N
 
 
 @pytest.mark.asyncio
-async def test_update_data_translates_unauthorized_refresh_to_reauth() -> None:
-    """Escalate a fresh unauthorized refresh failure to HA reauthentication."""
+async def test_update_data_client_recovered_401_returns_data_and_resets_unauthorized(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Return data when the client recovered a 401 inside load_data."""
     coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
     coordinator.data_flush = True
+    coordinator.systems = carrier_api.systems
+    coordinator._websocket_initialized = True
+    _attach_reauth_runtime(coordinator, carrier_api)
+    coordinator.resiliency.consecutive_unauthorized = 2
+
+    data = await coordinator._async_update_data()
+
+    assert data
+    assert coordinator.resiliency.consecutive_unauthorized == 0
+    assert carrier_api.login_calls == 0
+    assert coordinator._reauth_parked is False
+
+
+@pytest.mark.asyncio
+async def test_update_data_persisted_401_after_recovery_runs_final_login_then_reauth(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    setup_integration: Callable[..., Any],
+) -> None:
+    """Escalate when login succeeds but the retried refresh stays unauthorized."""
+    config_entry = await setup_integration()
+    coordinator = config_entry.runtime_data
+    coordinator.data_flush = True
+    carrier_api.load_data_error = CarrierApiAuthError(
+        "access rejected",
+        reason="access_rejected",
+    )
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 1
+    assert coordinator._reauth_parked is True
+    assert coordinator.reauth_probe_task is not None
+    assert config_entry.state is ConfigEntryState.LOADED
+
+
+@pytest.mark.asyncio
+async def test_update_data_final_login_success_false_reauths(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Escalate when Gap 3(a) login reports success=false and skip a data retry."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    coordinator.data_flush = True
+    _attach_reauth_runtime(coordinator, carrier_api)
+    carrier_api.load_data_error = CarrierApiAuthError("unauthorized")
+    carrier_api.login_error = CarrierApiAuthError("login failed", reason="login_failed")
+    load_calls_before = sum(1 for name, _ in carrier_api.calls if name == "load_data")
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 1
+    load_calls_after = sum(1 for name, _ in carrier_api.calls if name == "load_data")
+    assert load_calls_after - load_calls_before == 1
+    assert coordinator.reauth_probe_task is None
+
+
+@pytest.mark.asyncio
+async def test_update_data_transient_login_is_update_failed(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Keep a transient Gap 3(a) login on the UpdateFailed retry path."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    coordinator.data_flush = True
+    coordinator.update_interval = None
+    _attach_reauth_runtime(coordinator, carrier_api)
+    carrier_api.load_data_error = CarrierApiAuthError("unauthorized")
+    carrier_api.login_error = CarrierApiTokenRefreshError("transient login")
+
+    with pytest.raises(UpdateFailed, match="temporarily rejected"):
+        await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 1
+    assert coordinator.reauth_probe_task is None
+    assert coordinator._reauth_parked is False
+
+
+@pytest.mark.asyncio
+async def test_update_data_auth_failed_from_login_reauths(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Escalate AUTH_FAILED from the client after Gap 3(a) also fails login."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    coordinator.data_flush = True
+    _attach_reauth_runtime(coordinator, carrier_api)
+    carrier_api.load_data_error = CarrierApiAuthError("login failed", reason="login_failed")
+    carrier_api.login_error = CarrierApiAuthError("login failed", reason="login_failed")
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 1
+    assert coordinator.reauth_probe_task is None
+
+
+@pytest.mark.asyncio
+async def test_reauth_probe_logins_when_parked_and_exits_on_success(
+    carrier_api: FakeCarrierApiConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run one stored-credential probe login and schedule reload on success."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    _attach_reauth_runtime(coordinator, carrier_api)
+    coordinator._reauth_parked = True
+    coordinator.config_entry = SimpleNamespace(entry_id="entry-1")
+    reloads: list[str] = []
+
+    class _Flow:
+        @staticmethod
+        def async_progress_by_handler(_domain: str) -> list[dict[str, Any]]:
+            return []
+
+        @staticmethod
+        def async_abort(_flow_id: str) -> None:
+            return None
+
+    def create_task(coro: Any) -> None:
+        """Close a scheduled reload coroutine without running Home Assistant."""
+        if asyncio.iscoroutine(coro):
+            coro.close()
+
+    coordinator.hass = SimpleNamespace(
+        config_entries=SimpleNamespace(
+            flow=_Flow(),
+            async_reload=reloads.append,
+        ),
+        async_create_task=create_task,
+    )
+
+    async def instant_probe_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "custom_components.ha_carrier.carrier_data_update_coordinator._async_reauth_probe_sleep",
+        instant_probe_sleep,
+    )
+    await coordinator._async_reauth_login_probe()
+
+    assert carrier_api.login_calls == 1
+    assert coordinator._reauth_parked is False
+    assert reloads == ["entry-1"]
+
+
+@pytest.mark.asyncio
+async def test_update_data_translates_unauthorized_refresh_to_reauth(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Escalate unauthorized refresh through Gap 3(a) when login fails."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    coordinator.data_flush = True
+    _attach_reauth_runtime(coordinator, carrier_api)
+    carrier_api.login_error = CarrierApiAuthError("login failed", reason="login_failed")
 
     async def fake_full_refresh() -> None:
         """Raise an escalated Carrier auth failure."""
@@ -231,33 +410,91 @@ async def test_update_data_translates_unauthorized_refresh_to_reauth() -> None:
 
     with (
         patch.object(coordinator, "_async_full_refresh", fake_full_refresh),
-        pytest.raises(ConfigEntryAuthFailed) as exc_info,
+        pytest.raises(ConfigEntryAuthFailed),
     ):
         await coordinator._async_update_data()
 
-    assert exc_info.type.__name__ == "ConfigEntryAuthFailed"
+    assert carrier_api.login_calls == 1
     assert coordinator.data_flush is True
 
 
 @pytest.mark.asyncio
-async def test_update_data_keeps_plain_unauthorized_server_error_retryable() -> None:
-    """Keep non-escalated unauthorized transport errors on HA retry cadence."""
+async def test_update_data_keeps_plain_unauthorized_server_error_retryable(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Keep client token-refresh exhaustion on HA retry cadence without reauth."""
     coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
     coordinator.data_flush = True
     coordinator.update_interval = None
+    _attach_reauth_runtime(coordinator, carrier_api)
 
     async def fake_full_refresh() -> None:
-        """Raise a 401 transport response before resiliency escalation."""
-        raise CarrierApiAuthError("unauthorized")
+        """Raise a transient recovery exhaustion error."""
+        raise CarrierApiTokenRefreshError("recovery exhausted")
 
     with (
         patch.object(coordinator, "_async_full_refresh", fake_full_refresh),
-        pytest.raises(UpdateFailed, match="temporarily rejected"),
+        pytest.raises(UpdateFailed),
     ):
         await coordinator._async_update_data()
 
+    assert carrier_api.login_calls == 0
     assert coordinator.data_flush is True
     assert coordinator.update_interval is not None
+    assert coordinator.reauth_probe_task is None
+
+
+@pytest.mark.asyncio
+async def test_update_data_three_stale_token_401s_do_not_reauth_on_their_own(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Three generic unauthorized errors do not reauth until Gap 3(a) decides."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    coordinator.data_flush = True
+    _attach_reauth_runtime(coordinator, carrier_api)
+    carrier_api.load_data_error = CarrierApiAuthError("unauthorized")
+    carrier_api.login_error = CarrierApiTokenRefreshError("transient login")
+
+    for _ in range(3):
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 3
+    assert coordinator.reauth_probe_task is None
+
+    carrier_api.login_error = CarrierApiAuthError("login failed", reason="login_failed")
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_update_data_three_energy_401s_do_not_reauth_without_final_login(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Energy 401s propagate AuthError and do not reauth without Gap 3(a)."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    coordinator.data_flush = False
+    coordinator.timestamp_all_data = datetime.now(UTC)
+    coordinator.systems = [build_carrier_system(), build_carrier_system(serial="DEF456")]
+    _attach_reauth_runtime(coordinator, carrier_api)
+    carrier_api.login_error = CarrierApiTokenRefreshError("transient login")
+
+    async def fake_retry(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        """Raise unauthorized for every per-system energy request."""
+        raise CarrierApiAuthError("unauthorized")
+
+    with patch(
+        "custom_components.ha_carrier.carrier_data_update_coordinator.async_call_with_retry",
+        fake_retry,
+    ):
+        for _ in range(3):
+            with pytest.raises(UpdateFailed):
+                await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 3
+    assert coordinator.reauth_probe_task is None
 
 
 @pytest.mark.asyncio
@@ -308,9 +545,12 @@ async def test_energy_refresh_records_one_unauthorized_per_cycle(
         """Raise unauthorized for every per-system energy request."""
         raise CarrierApiAuthError("unauthorized")
 
-    with patch(
-        "custom_components.ha_carrier.carrier_data_update_coordinator.async_call_with_retry",
-        fake_retry,
+    with (
+        patch(
+            "custom_components.ha_carrier.carrier_data_update_coordinator.async_call_with_retry",
+            fake_retry,
+        ),
+        pytest.raises(CarrierApiAuthError),
     ):
         await coordinator._async_energy_refresh()
 
@@ -836,7 +1076,7 @@ async def test_failed_write_does_not_begin_intercept() -> None:
 async def test_energy_refresh_escalates_after_threshold(
     carrier_api: FakeCarrierApiConnection,
 ) -> None:
-    """Raise CarrierUnauthorizedError once the energy-cycle auth threshold is crossed."""
+    """Propagate CarrierApiAuthError from energy instead of threshold reauth."""
     coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
     coordinator.systems = [build_carrier_system()]
     _set_coordinator_api_connection(coordinator, carrier_api)
@@ -852,7 +1092,7 @@ async def test_energy_refresh_escalates_after_threshold(
             "custom_components.ha_carrier.carrier_data_update_coordinator.async_call_with_retry",
             fake_retry,
         ),
-        pytest.raises(CarrierUnauthorizedError),
+        pytest.raises(CarrierApiAuthError),
     ):
         await coordinator._async_energy_refresh()
 
