@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+import contextvars
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -100,11 +101,17 @@ class FakeCarrierApiConnection:
         self.login_hold: asyncio.Event | None = None
         self.login_started = asyncio.Event()
         self.no_recovery_retry_calls = 0
+        self.no_recovery_entered = asyncio.Event()
+        self.no_recovery_hold: asyncio.Event | None = None
         self.cleanup_calls = 0
         self.constructor_kwargs: dict[str, Any] = {}
         self._closing = False
         self._generation = 1
         self._login_lock = asyncio.Lock()
+        self._access_recovery_disabled: contextvars.ContextVar[int] = contextvars.ContextVar(
+            f"access_recovery_disabled_{id(self)}",
+            default=0,
+        )
         self.rejected_generation: int | None = None
         self.auth_wave_target: int | None = None
         self.auth_wave_count = 0
@@ -136,9 +143,35 @@ class FakeCarrierApiConnection:
 
     @asynccontextmanager
     async def no_recovery_authenticated_retry(self) -> AsyncIterator[None]:
-        """Record a no-recovery authenticated retry used after Gap 3(a) login."""
+        """Disable recovery in this task, matching ``ApiConnectionGraphql``.
+
+        The disabled count is a per-connection ``ContextVar``. Nested use is
+        counted. Child tasks spawned inside inherit it; pre-existing siblings
+        do not. The first 401 inside this context raises ``access_rejected``.
+        """
         self.no_recovery_retry_calls += 1
-        yield
+        token = self._access_recovery_disabled.set(self._access_recovery_disabled.get() + 1)
+        self.no_recovery_entered.set()
+        try:
+            if self.no_recovery_hold is not None:
+                await self.no_recovery_hold.wait()
+            yield
+        finally:
+            self._access_recovery_disabled.reset(token)
+
+    def _raise_unauthorized(self, error: BaseException) -> None:
+        """Raise an unauthorized error, converting inside a no-recovery context.
+
+        Args:
+            error: Unauthorized error that would be raised by this call.
+
+        Raises:
+            CarrierApiAuthError: ``reason="access_rejected"`` when this task is
+                inside ``no_recovery_authenticated_retry``; otherwise ``error``.
+        """
+        if self._access_recovery_disabled.get() > 0 and isinstance(error, CarrierApiAuthError):
+            raise CarrierApiAuthError(str(error), reason="access_rejected") from error
+        raise error
 
     async def _async_join_rejected_generation(self) -> None:
         """Overlap callers on the rejected generation, then raise if still current."""
@@ -148,15 +181,20 @@ class FakeCarrierApiConnection:
                 self.auth_wave_ready.set()
             await self.auth_wave_ready.wait()
         if self.rejected_generation is not None and self._generation == self.rejected_generation:
-            raise CarrierApiAuthError("unauthorized")
+            self._raise_unauthorized(CarrierApiAuthError("unauthorized"))
 
     async def load_data(self) -> list[System]:
         """Return configured systems or raise a configured load error."""
         self.calls.append(("load_data", {}))
         await self._async_join_rejected_generation()
         if self.load_data_errors:
-            raise self.load_data_errors.pop(0)
+            error = self.load_data_errors.pop(0)
+            if isinstance(error, CarrierApiAuthError):
+                self._raise_unauthorized(error)
+            raise error
         if self.load_data_error is not None:
+            if isinstance(self.load_data_error, CarrierApiAuthError):
+                self._raise_unauthorized(self.load_data_error)
             raise self.load_data_error
         return self.systems
 

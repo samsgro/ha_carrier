@@ -456,6 +456,53 @@ async def test_websocket_and_coordinator_refresh_share_one_client_recovery(
     assert config_entry.state is ConfigEntryState.LOADED
 
 
+@pytest.mark.asyncio
+async def test_sibling_refresh_recovers_while_fallback_holds_no_recovery(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    setup_integration: Callable[..., Awaitable[ConfigEntry]],
+) -> None:
+    """A websocket refresh started outside Gap 3(a) still recovers once."""
+    config_entry = await setup_integration()
+    coordinator = config_entry.runtime_data
+    coordinator.data_flush = True
+    carrier_api.calls.clear()
+    carrier_api.login_calls = 0
+    carrier_api.login_started.clear()
+    carrier_api.no_recovery_entered.clear()
+    carrier_api.load_data_errors = [CarrierApiAuthError("unauthorized")]
+    fallback_hold = asyncio.Event()
+    carrier_api.no_recovery_hold = fallback_hold
+
+    task_a = asyncio.create_task(coordinator._async_update_data())
+    await asyncio.wait_for(carrier_api.no_recovery_entered.wait(), timeout=2)
+    assert carrier_api.login_calls == 1
+    assert not task_a.done()
+    generation_at_hold = carrier_api._generation
+    carrier_api.rejected_generation = generation_at_hold
+    carrier_api.no_recovery_hold = None
+    carrier_api.login_started.clear()
+    carrier_api.no_recovery_entered.clear()
+
+    async def sibling_websocket_refresh() -> list[dict[str, object]]:
+        """Run a websocket-requested refresh through the coordinator."""
+        return await coordinator._async_update_data()
+
+    task_b = asyncio.create_task(sibling_websocket_refresh())
+    await asyncio.wait_for(carrier_api.login_started.wait(), timeout=2)
+    b_result = await asyncio.wait_for(task_b, timeout=2)
+    fallback_hold.set()
+    a_result = await asyncio.wait_for(task_a, timeout=2)
+
+    assert b_result
+    assert a_result
+    assert carrier_api.login_calls == 2
+    assert carrier_api._generation == generation_at_hold + 1
+    assert coordinator._reauth_parked is False
+    assert coordinator.reauth_probe_task is None
+    assert config_entry.state is ConfigEntryState.LOADED
+
+
 async def _async_unload_loaded_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
