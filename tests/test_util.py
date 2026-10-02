@@ -17,6 +17,7 @@ import pytest
 
 from custom_components.ha_carrier.util import (
     async_redact_data,
+    is_access_rejected,
     is_retryable_error,
     is_transient_transport_error,
     is_unauthorized_error,
@@ -47,6 +48,7 @@ def test_integration_imports_supported_carrier_api_exception_names(module_path: 
     ("classifier", "nested_error"),
     [
         (is_unauthorized_error, CarrierApiAuthError("unauthorized")),
+        (is_access_rejected, CarrierApiAuthError("access rejected", reason="access_rejected")),
         (is_transient_transport_error, CarrierApiConnectionError("temporary")),
         (is_transient_transport_error, CarrierApiTokenRefreshError("temporary")),
         (is_transient_transport_error, CarrierApiWebsocketError("temporary")),

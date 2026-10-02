@@ -38,6 +38,7 @@ from custom_components.ha_carrier.const import (
     DOMAIN,
     HEAT_SOURCE_ODU_ONLY_LABEL,
 )
+from custom_components.ha_carrier.util import is_unauthorized_error
 
 from .conftest import (
     IDENTITY_ID,
@@ -295,7 +296,7 @@ async def test_reauth_probe_reloads_and_aborts_flow_on_successful_login(
     assert form["type"] is FlowResultType.FORM
 
     rejected = CarrierApiAuthError("access rejected", reason="access_rejected")
-    carrier_api.load_data_errors = [rejected, rejected]
+    carrier_api.load_data_errors = [rejected]
     coordinator.data_flush = True
     with pytest.raises(ConfigEntryAuthFailed):
         await coordinator._async_update_data()
@@ -304,7 +305,7 @@ async def test_reauth_probe_reloads_and_aborts_flow_on_successful_login(
         await probe
     await hass.async_block_till_done()
 
-    assert carrier_api.login_calls >= 2
+    assert carrier_api.login_calls == 1
     progress = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
     assert not any(
         (item.get("context") or {}).get("source") == config_entries.SOURCE_REAUTH
@@ -380,27 +381,79 @@ async def test_reauth_probe_cancelled_on_unload(
 async def test_websocket_and_coordinator_refresh_share_one_client_recovery(
     hass: HomeAssistant,
     carrier_api: FakeCarrierApiConnection,
-    monkeypatch: pytest.MonkeyPatch,
     setup_integration: Callable[..., Awaitable[ConfigEntry]],
 ) -> None:
-    """Overlapping websocket and coordinator refreshes do not raise two reauths."""
-    monkeypatch.setattr("custom_components.ha_carrier.compute_backoff_delay", lambda *_: 0)
+    """Overlapping coordinator, energy, websocket, and write 401s share one login."""
     config_entry = await setup_integration()
     coordinator = config_entry.runtime_data
+    rejected_generation = carrier_api._generation
+    carrier_api.rejected_generation = rejected_generation
+    carrier_api.auth_wave_target = 4
+    carrier_api.login_hold = asyncio.Event()
     carrier_api.calls.clear()
-    carrier_api.api_websocket.listener_errors.append(CarrierApiConnectionError("closed"))
+    carrier_api.login_calls = 0
+    carrier_api.login_started.clear()
 
-    await coordinator.async_request_refresh()
-    for _ in range(10):
-        await hass.async_block_till_done()
-        if carrier_api.api_websocket.listener_calls >= 2:
-            break
-        await asyncio.sleep(0)
+    async def full_refresh_with_gap3() -> None:
+        """Run a full refresh through the Gap 3(a) unauthorized handler."""
+        try:
+            await coordinator._async_full_refresh()
+        except BaseException as error:
+            if is_unauthorized_error(error):
+                await coordinator._async_final_login_then_retry(
+                    error, coordinator._async_full_refresh, "full data refresh"
+                )
+                return
+            raise
 
+    async def energy_refresh_with_gap3() -> None:
+        """Run an energy refresh through the Gap 3(a) unauthorized handler."""
+        try:
+            await coordinator._async_energy_refresh()
+        except BaseException as error:
+            if is_unauthorized_error(error):
+                await coordinator._async_final_login_then_retry(
+                    error, coordinator._async_energy_refresh, "energy refresh"
+                )
+                return
+            raise
+
+    async def websocket_requested_refresh() -> None:
+        """Run a websocket-requested full refresh through Gap 3(a)."""
+        try:
+            await coordinator._async_full_refresh()
+        except BaseException as error:
+            if is_unauthorized_error(error):
+                await coordinator._async_final_login_then_retry(
+                    error, coordinator._async_full_refresh, "websocket refresh"
+                )
+                return
+            raise
+
+    async def write_against_rejected_generation() -> None:
+        """Issue a write against the same rejected generation."""
+        await carrier_api.set_config_mode(
+            system_serial=carrier_api.systems[0].profile.serial,
+            mode="off",
+        )
+
+    tasks = [
+        asyncio.create_task(full_refresh_with_gap3()),
+        asyncio.create_task(energy_refresh_with_gap3()),
+        asyncio.create_task(websocket_requested_refresh()),
+        asyncio.create_task(write_against_rejected_generation()),
+    ]
+    await carrier_api.auth_wave_ready.wait()
+    assert carrier_api.auth_wave_count >= 4
+    await carrier_api.login_started.wait()
+    assert any(not task.done() for task in tasks)
+    carrier_api.login_hold.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert carrier_api.login_calls == 1
+    assert carrier_api._generation == rejected_generation + 1
+    assert sum(isinstance(result, BaseException) for result in results) == 1
     assert config_entry.state is ConfigEntryState.LOADED
-    assert coordinator.last_update_success is True
-    assert carrier_api.login_calls == 0
-    assert coordinator.reauth_probe_task is None
 
 
 async def _async_unload_loaded_entry(

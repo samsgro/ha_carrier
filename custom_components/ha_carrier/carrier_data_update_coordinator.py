@@ -51,6 +51,7 @@ from .util import (
     RECOVERABLE_REFRESH_EXCEPTIONS,
     RECOVERABLE_WRITE_COMMUNICATION_EXCEPTIONS,
     async_redact_data,
+    is_access_rejected,
     is_credential_rejection,
     is_unauthorized_error,
 )
@@ -306,11 +307,12 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         Performs either a full system refresh or a lighter energy-only refresh,
         depending on whether the coordinator has been marked dirty. The shared
         `ResiliencyState` tracks 401 and transient failures across API calls.
-        Unauthorized failures run one final stored-credential ``login()``
-        before ``ConfigEntryAuthFailed``. Reauth is raised only when that
-        login reports ``success=false`` or a 401 persists after a successful
-        recovery produced a new generation. Transient login and token-refresh
-        failures remain ``UpdateFailed``.
+        Unauthorized failures that have not already consumed library recovery
+        run one generation-aware stored-credential ``login()`` before
+        ``ConfigEntryAuthFailed``. A surfaced ``access_rejected`` means the
+        library already performed that recovery and the retried request was
+        still rejected, so this method escalates without another ``login()``.
+        Transient login and token-refresh failures remain ``UpdateFailed``.
 
         Returns:
             list[dict[str, Any]]: List of mappings representing tracked systems.
@@ -345,6 +347,8 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             raise
         except (CarrierUnauthorizedError, *RECOVERABLE_REFRESH_EXCEPTIONS) as error:
             if is_unauthorized_error(error):
+                if is_access_rejected(error):
+                    self._escalate_persisted_after_recovery(error)
                 return await self._async_final_login_then_retry(
                     error, refresh_operation, refresh_context
                 )
@@ -478,6 +482,38 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         self.timestamp_energy = datetime.now(UTC)
         self.update_interval = timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
 
+    def _observed_token_generation(self) -> int | None:
+        """Return the published token generation at the current failure.
+
+        Returns:
+            int | None: Diagnostics generation when present.
+        """
+        diagnostics = getattr(self.api_connection, "token_session_diagnostics", None)
+        if not callable(diagnostics):
+            return None
+        snapshot = diagnostics()
+        if not isinstance(snapshot, dict):
+            return None
+        generation = snapshot.get("generation")
+        return generation if isinstance(generation, int) else None
+
+    def _escalate_persisted_after_recovery(self, error: BaseException) -> NoReturn:
+        """Escalate a persisted 401 after the one allowed recovery.
+
+        Args:
+            error: Unauthorized error that survived library or Gap 3(a) recovery.
+
+        Raises:
+            ConfigEntryAuthFailed: Always raised after logging and probe start.
+        """
+        self.data_flush = True
+        self.update_interval = timedelta(minutes=1)
+        self._emit_reauth_escalation("persisted_after_recovery")
+        self._start_reauth_probe()
+        raise ConfigEntryAuthFailed(
+            "Carrier API rejected credentials; reauthentication required."
+        ) from error
+
     def _login_reported_auth_failed(self, error: BaseException) -> bool:
         """Return True when a login attempt reported credential rejection.
 
@@ -593,10 +629,11 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         refresh_operation: Callable[[], Awaitable[None]],
         refresh_context: str,
     ) -> list[dict[str, Any]]:
-        """Run one fresh stored-credential login, then retry or escalate.
+        """Run one generation-aware stored-credential login, then retry or escalate.
 
         Args:
-            error: Unauthorized error surfaced by the refresh operation.
+            error: Unauthorized error surfaced by the refresh operation. This
+                path is not used for ``reason="access_rejected"``.
             refresh_operation: Full or energy refresh to retry after login.
             refresh_context: Human-readable refresh path name for errors.
 
@@ -610,8 +647,9 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         """
         self.data_flush = True
         self.update_interval = timedelta(minutes=1)
+        expected_generation = self._observed_token_generation()
         try:
-            await self.api_connection.login()
+            await self.api_connection.login(expected_generation=expected_generation)
         except CarrierApiAuthError as login_error:
             if self._login_reported_auth_failed(login_error):
                 self._emit_reauth_escalation("login_failed")
@@ -628,7 +666,8 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             ) from login_error
 
         try:
-            await refresh_operation()
+            async with self.api_connection.no_recovery_authenticated_retry():
+                await refresh_operation()
         except (
             asyncio.CancelledError,
             KeyboardInterrupt,
@@ -637,11 +676,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             raise
         except Exception as retry_error:
             if is_unauthorized_error(retry_error):
-                self._emit_reauth_escalation("persisted_after_recovery")
-                self._start_reauth_probe()
-                raise ConfigEntryAuthFailed(
-                    "Carrier API rejected credentials; reauthentication required."
-                ) from retry_error
+                self._escalate_persisted_after_recovery(retry_error)
             if isinstance(retry_error, RECOVERABLE_REFRESH_EXCEPTIONS):
                 raise UpdateFailed(
                     f"Unexpected error during Carrier {refresh_context}: {retry_error}"

@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from carrier_api import Config, Energy, EntryLevelSystem, Profile, Status, System
+from carrier_api import (
+    CarrierApiAuthError,
+    Config,
+    Energy,
+    EntryLevelSystem,
+    Profile,
+    Status,
+    System,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
@@ -88,9 +97,18 @@ class FakeCarrierApiConnection:
         self.load_data_errors: list[BaseException] = []
         self.login_calls = 0
         self.login_error: BaseException | None = None
+        self.login_hold: asyncio.Event | None = None
+        self.login_started = asyncio.Event()
+        self.no_recovery_retry_calls = 0
         self.cleanup_calls = 0
         self.constructor_kwargs: dict[str, Any] = {}
         self._closing = False
+        self._generation = 1
+        self._login_lock = asyncio.Lock()
+        self.rejected_generation: int | None = None
+        self.auth_wave_target: int | None = None
+        self.auth_wave_count = 0
+        self.auth_wave_ready = asyncio.Event()
         self.refresh_posts_after_cleanup = 0
 
     @property
@@ -98,16 +116,44 @@ class FakeCarrierApiConnection:
         """Return whether cleanup has started, matching the production property."""
         return self._closing
 
-    async def login(self) -> None:
-        """Record a stored-credential login or raise a configured login error."""
-        self.calls.append(("login", {}))
-        self.login_calls += 1
-        if self.login_error is not None:
-            raise self.login_error
+    async def login(self, *, expected_generation: int | None = None) -> None:
+        """Record a stored-credential login or raise a configured login error.
+
+        An integration-level login is skipped when ``expected_generation`` is
+        no longer current, matching ``ApiConnectionGraphql.login``.
+        """
+        async with self._login_lock:
+            if expected_generation is not None and self._generation != expected_generation:
+                return
+            self.calls.append(("login", {"expected_generation": expected_generation}))
+            self.login_calls += 1
+            self.login_started.set()
+            if self.login_hold is not None:
+                await self.login_hold.wait()
+            if self.login_error is not None:
+                raise self.login_error
+            self._generation += 1
+
+    @asynccontextmanager
+    async def no_recovery_authenticated_retry(self) -> AsyncIterator[None]:
+        """Record a no-recovery authenticated retry used after Gap 3(a) login."""
+        self.no_recovery_retry_calls += 1
+        yield
+
+    async def _async_join_rejected_generation(self) -> None:
+        """Overlap callers on the rejected generation, then raise if still current."""
+        if self.auth_wave_target is not None:
+            self.auth_wave_count += 1
+            if self.auth_wave_count >= self.auth_wave_target:
+                self.auth_wave_ready.set()
+            await self.auth_wave_ready.wait()
+        if self.rejected_generation is not None and self._generation == self.rejected_generation:
+            raise CarrierApiAuthError("unauthorized")
 
     async def load_data(self) -> list[System]:
         """Return configured systems or raise a configured load error."""
         self.calls.append(("load_data", {}))
+        await self._async_join_rejected_generation()
         if self.load_data_errors:
             raise self.load_data_errors.pop(0)
         if self.load_data_error is not None:
@@ -142,7 +188,8 @@ class FakeCarrierApiConnection:
         """
         return {
             "state": "ACTIVE",
-            "generation": 1,
+            "generation": self._generation,
+            "rejected_generation": self.rejected_generation,
             "seconds_until_expiry": 3600.0,
             "last_event": "login_committed",
             "last_outcome": "success",
@@ -169,12 +216,14 @@ class FakeCarrierApiConnection:
             dict[str, Any]: Carrier GraphQL-shaped energy response.
         """
         self.calls.append(("get_energy", {"system_serial": system_serial}))
+        await self._async_join_rejected_generation()
         system = self._system(system_serial)
         return {"infinityEnergy": deepcopy(system.energy.raw)}
 
     async def set_config_mode(self, *, system_serial: str, mode: Any) -> None:
         """Record a system mode write."""
         self.calls.append(("set_config_mode", {"system_serial": system_serial, "mode": mode}))
+        await self._async_join_rejected_generation()
 
     async def set_config_heat_humidity(self, *, system_serial: str, humidity_target: int) -> None:
         """Record a target humidity write."""

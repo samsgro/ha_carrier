@@ -206,6 +206,22 @@ def is_credential_rejection(error: BaseException) -> bool:
     return False
 
 
+def is_access_rejected(error: BaseException) -> bool:
+    """Return True when the client already consumed unauthorized recovery.
+
+    Args:
+        error: Exception raised by the Carrier client or transport.
+
+    Returns:
+        bool: True when any exception in the chain is ``CarrierApiAuthError``
+            with ``reason == "access_rejected"``.
+    """
+    for current in _iter_exception_chain(error):
+        if isinstance(current, CarrierApiAuthError) and current.reason == "access_rejected":
+            return True
+    return False
+
+
 def is_retryable_error(error: BaseException) -> bool:
     """Return True if any exception in the chain should be retried with backoff.
 

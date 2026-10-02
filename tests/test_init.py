@@ -265,7 +265,7 @@ async def test_setup_entry_first_refresh_access_rejected_recovers_with_final_log
     hass: HomeAssistant,
     patch_carrier_api: FakeCarrierApiConnection,
 ) -> None:
-    """Recover first-refresh access_rejected via Gap 3(a) without starting a probe."""
+    """Escalate first-refresh access_rejected without an extra login or probe."""
     patch_carrier_api.load_data_errors.append(
         CarrierApiAuthError("access rejected", reason="access_rejected")
     )
@@ -276,13 +276,17 @@ async def test_setup_entry_first_refresh_access_rejected_recovers_with_final_log
     )
     config_entry.add_to_hass(hass)
 
-    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    assert not await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
 
-    coordinator = config_entry.runtime_data
-    assert config_entry.state is ConfigEntryState.LOADED
-    assert patch_carrier_api.login_calls == 1
-    assert coordinator.reauth_probe_task is None
+    assert config_entry.state is ConfigEntryState.SETUP_ERROR
+    assert patch_carrier_api.login_calls == 0
+    probe_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith(f"{DOMAIN}_reauth_probe_")
+    ]
+    assert probe_tasks == []
 
 
 @pytest.mark.asyncio

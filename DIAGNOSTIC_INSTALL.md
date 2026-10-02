@@ -18,14 +18,14 @@ runtime code ignores them.
 | --- | --- |
 | `ha_carrier` version | `2.28.2+oauthfix.2` |
 | `carrier-api` version | `3.6.0+oauthfix.2` |
-| Immutable `carrier-api` commit | `be178e24841c1fdc8883f41859748d9a2c699d61` |
+| Immutable `carrier-api` commit | `5de4ebc01478bb3b421779c9892d385b113c7621` |
 | `carrier-api` fork | https://github.com/samsgro/carrier_api/tree/oauth-refresh-diagnostics |
 | `ha_carrier` fork | https://github.com/samsgro/ha_carrier/tree/oauth-refresh-diagnostics |
 
 Manifest requirement:
 
 ```text
-carrier-api @ git+https://github.com/samsgro/carrier_api.git@be178e24841c1fdc8883f41859748d9a2c699d61
+carrier-api @ git+https://github.com/samsgro/carrier_api.git@5de4ebc01478bb3b421779c9892d385b113c7621
 ```
 
 That requirement is a PEP 508 direct URL pin. Home Assistant will install it
@@ -75,7 +75,7 @@ SHA from `manifest.json`:
 python3.14 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install \
-  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@be178e24841c1fdc8883f41859748d9a2c699d61"
+  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@5de4ebc01478bb3b421779c9892d385b113c7621"
 .venv/bin/python -c "from carrier_api.const import VERSION; print(VERSION)"
 ```
 

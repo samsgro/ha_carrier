@@ -269,10 +269,63 @@ async def test_update_data_persisted_401_after_recovery_runs_final_login_then_re
     carrier_api: FakeCarrierApiConnection,
     setup_integration: Callable[..., Any],
 ) -> None:
-    """Escalate when login succeeds but the retried refresh stays unauthorized."""
+    """Escalate when Gap 3(a) login succeeds but the no-recovery retry stays unauthorized."""
     config_entry = await setup_integration()
     coordinator = config_entry.runtime_data
     coordinator.data_flush = True
+    carrier_api.load_data_error = CarrierApiAuthError("unauthorized")
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 1
+    assert carrier_api.no_recovery_retry_calls == 1
+    assert coordinator._reauth_parked is True
+    assert coordinator.reauth_probe_task is not None
+    assert config_entry.state is ConfigEntryState.LOADED
+
+
+@pytest.mark.asyncio
+async def test_update_data_access_rejected_escalates_without_extra_login(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    setup_integration: Callable[..., Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Escalate access_rejected without a second integration login."""
+    config_entry = await setup_integration()
+    coordinator = config_entry.runtime_data
+    coordinator.data_flush = True
+    carrier_api.load_data_error = CarrierApiAuthError(
+        "access rejected",
+        reason="access_rejected",
+    )
+    caplog.set_level(
+        "WARNING", logger="custom_components.ha_carrier.carrier_data_update_coordinator"
+    )
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+    assert carrier_api.login_calls == 0
+    assert carrier_api.no_recovery_retry_calls == 0
+    assert coordinator._reauth_parked is True
+    assert coordinator.reauth_probe_task is not None
+    assert "escalation_reason=persisted_after_recovery" in caplog.text
+    assert config_entry.state is ConfigEntryState.LOADED
+
+
+@pytest.mark.asyncio
+async def test_update_data_persisted_rejection_never_advances_past_one_extra_generation(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    setup_integration: Callable[..., Any],
+) -> None:
+    """A persisted rejection after client recovery must not create a third generation."""
+    config_entry = await setup_integration()
+    coordinator = config_entry.runtime_data
+    coordinator.data_flush = True
+    carrier_api._generation = 2
     carrier_api.load_data_error = CarrierApiAuthError(
         "access rejected",
         reason="access_rejected",
@@ -281,10 +334,10 @@ async def test_update_data_persisted_401_after_recovery_runs_final_login_then_re
     with pytest.raises(ConfigEntryAuthFailed):
         await coordinator._async_update_data()
 
-    assert carrier_api.login_calls == 1
+    assert carrier_api.login_calls == 0
+    assert carrier_api._generation == 2
+    assert carrier_api.token_session_diagnostics()["generation"] == 2
     assert coordinator._reauth_parked is True
-    assert coordinator.reauth_probe_task is not None
-    assert config_entry.state is ConfigEntryState.LOADED
 
 
 @pytest.mark.asyncio
